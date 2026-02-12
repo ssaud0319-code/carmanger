@@ -4,29 +4,47 @@ import sqlite3
 from datetime import datetime
 import os
 import shutil
+from contextlib import contextmanager
 import threading
 import time
-from contextlib import contextmanager
+import json
+from pathlib import Path
+import base64
+from dotenv import load_dotenv
+import random
+
+# تحميل المتغيرات البيئية
+load_dotenv()
 
 # محاولة استيراد مكتبة MEGA
 try:
-    from mega import Mega
+    from mega import Mega, MegaRequestException
     MEGA_AVAILABLE = True
 except ImportError:
     MEGA_AVAILABLE = False
 
-# محاولة استيراد openpyxl و fpdf للتقارير
+# محاولة استيراد PIL للتعامل مع الصور
+try:
+    from PIL import Image
+    import io
+    PIL_AVAILABLE = True
+except ImportError:
+    PIL_AVAILABLE = False
+
+# محاولة استيراد مكتبات إنشاء ملفات PDF
+try:
+    from fpdf import FPDF
+    FPDF_AVAILABLE = True
+except ImportError:
+    FPDF_AVAILABLE = False
+
+# محاولة استيراد openpyxl للتصدير إلى Excel
 try:
     import openpyxl
+    from openpyxl import Workbook
     EXCEL_AVAILABLE = True
 except ImportError:
     EXCEL_AVAILABLE = False
-
-try:
-    from fpdf import FPDF
-    PDF_AVAILABLE = True
-except ImportError:
-    PDF_AVAILABLE = False
 
 # إعدادات قاعدة البيانات
 DB_NAME = 'carts_management.db'
@@ -34,20 +52,16 @@ DEFAULT_USER = 'سعود'
 DEFAULT_PASSWORD = '123456'
 APP_NAME = "نظام إدارة العربات اليدوية - الحرم المكي الشريف"
 
-# إعدادات MEGA
-MEGA_EMAIL = "ssaud03192gmail.com"
-MEGA_PASSWORD = "saud2026"
+# إعدادات MEGA - من المتغيرات البيئية
+MEGA_EMAIL = os.getenv('MEGA_EMAIL', '')
+MEGA_PASSWORD = os.getenv('MEGA_PASSWORD', '')
 
 # قائمة المستودعات الأساسية
 WAREHOUSES = [
-    {'name': 'المستودع الرئيسي', 'capacity': 5000, 'type': 'main',
-     'description': 'المستودع الرئيسي الكبير خارج المنطقة المركزية'},
-    {'name': 'المستودع الخارجي', 'capacity': 1500, 'type': 'external',
-     'description': 'المستودع المركزي المتوسط الحجم'},
-    {'name': 'مركز التشغيل الشمالي', 'capacity': 500, 'type': 'north',
-     'description': 'مركز التشغيل الشمالي'},
-    {'name': 'مركز التشغيل الجنوبي', 'capacity': 500, 'type': 'south',
-     'description': 'مركز التشغيل الجنوبي'}
+    {'name': 'المستودع الرئيسي', 'capacity': 5000, 'type': 'main', 'description': 'المستودع الرئيسي الكبير خارج المنطقة المركزية'},
+    {'name': 'المستودع الخارجي', 'capacity': 1500, 'type': 'external', 'description': 'المستودع المركزي المتوسط الحجم'},
+    {'name': 'مركز التشغيل الشمالي', 'capacity': 500, 'type': 'north', 'description': 'مركز التشغيل الشمالي'},
+    {'name': 'مركز التشغيل الجنوبي', 'capacity': 500, 'type': 'south', 'description': 'مركز التشغيل الجنوبي'}
 ]
 
 # حالات العربات
@@ -64,7 +78,7 @@ MAINTENANCE_STATUS = {
     'completed': 'منجزة'
 }
 
-# الصلاحيات الافتراضية للمستخدمين الجدد
+# الصلاحيات الافتراضية
 DEFAULT_PERMISSIONS = {
     'can_view_dashboard': 1,
     'can_manage_carts': 1,
@@ -86,7 +100,7 @@ DEFAULT_PERMISSIONS = {
     'can_change_own_password': 1
 }
 
-# ألوان احترافية
+# الألوان
 COLORS = {
     'primary': '#3498db',
     'success': '#27ae60',
@@ -106,21 +120,23 @@ COLORS = {
 class DatabaseManager:
     """مدير قاعدة البيانات - نمط Singleton"""
     _instance = None
-
+    
     def __new__(cls):
         if cls._instance is None:
             cls._instance = super().__new__(cls)
             cls._instance.init_database()
         return cls._instance
-
+    
     def init_database(self):
+        """تهيئة قاعدة البيانات وإنشاء الجداول"""
         self.conn = sqlite3.connect(DB_NAME, check_same_thread=False)
         self.conn.execute("PRAGMA foreign_keys = ON")
         self.create_tables()
         self.init_default_data()
-
+    
     @contextmanager
     def get_cursor(self):
+        """إنشاء مؤشر قاعدة البيانات مع الإغلاق التلقائي"""
         cursor = self.conn.cursor()
         try:
             yield cursor
@@ -130,8 +146,9 @@ class DatabaseManager:
             raise e
         finally:
             cursor.close()
-
+    
     def create_tables(self):
+        """إنشاء جداول قاعدة البيانات"""
         queries = [
             """
             CREATE TABLE IF NOT EXISTS users (
@@ -268,15 +285,18 @@ class DatabaseManager:
             )
             """
         ]
+        
         with self.get_cursor() as cursor:
             for query in queries:
                 cursor.execute(query)
-
+    
     def init_default_data(self):
+        """إدخال البيانات الافتراضية"""
         with self.get_cursor() as cursor:
-            # المستخدم الرئيسي
+            # إضافة المستخدم الرئيسي
             cursor.execute("SELECT * FROM users WHERE username = ?", (DEFAULT_USER,))
             admin = cursor.fetchone()
+            
             if not admin:
                 cursor.execute(
                     """INSERT INTO users (username, password, full_name, role, is_active) 
@@ -284,45 +304,52 @@ class DatabaseManager:
                     (DEFAULT_USER, DEFAULT_PASSWORD, 'سعود آل سعود')
                 )
                 admin_id = cursor.lastrowid
+                
+                # إضافة صلاحيات المدير
                 permissions = DEFAULT_PERMISSIONS.copy()
                 for key in permissions:
                     permissions[key] = 1
+                
                 columns = ['user_id'] + list(permissions.keys())
                 values = [admin_id] + list(permissions.values())
                 placeholders = ','.join(['?' for _ in columns])
+                
                 cursor.execute(
                     f"INSERT INTO user_permissions ({','.join(columns)}) VALUES ({placeholders})",
                     values
                 )
-
-            # إعدادات التطبيق
+            
+            # إضافة إعدادات التطبيق الافتراضية
             cursor.execute("SELECT * FROM app_settings WHERE setting_key = 'app_name'")
             if not cursor.fetchone():
                 cursor.execute(
                     "INSERT INTO app_settings (setting_key, setting_value, description) VALUES (?, ?, ?)",
                     ('app_name', APP_NAME, 'اسم التطبيق الرئيسي')
                 )
+            
             cursor.execute("SELECT * FROM app_settings WHERE setting_key = 'company_name'")
             if not cursor.fetchone():
                 cursor.execute(
                     "INSERT INTO app_settings (setting_key, setting_value, description) VALUES (?, ?, ?)",
-                    ('company_name', 'الرئاسة العامة لشؤون المسجد الحرام والمسجد النبوي',
-                     'اسم الجهة المشغلة')
+                    ('company_name', 'الرئاسة العامة لشؤون المسجد الحرام والمسجد النبوي', 'اسم الجهة المشغلة')
                 )
+            
+            # إضافة إعدادات MEGA من المتغيرات البيئية
             cursor.execute("SELECT * FROM app_settings WHERE setting_key = 'mega_email'")
             if not cursor.fetchone():
                 cursor.execute(
                     "INSERT INTO app_settings (setting_key, setting_value, description) VALUES (?, ?, ?)",
                     ('mega_email', MEGA_EMAIL, 'بريد MEGA للنسخ الاحتياطي السحابي')
                 )
+            
             cursor.execute("SELECT * FROM app_settings WHERE setting_key = 'mega_password'")
             if not cursor.fetchone():
                 cursor.execute(
                     "INSERT INTO app_settings (setting_key, setting_value, description) VALUES (?, ?, ?)",
                     ('mega_password', MEGA_PASSWORD, 'كلمة مرور MEGA للنسخ الاحتياطي السحابي')
                 )
-
-            # المستودعات الأساسية
+            
+            # إضافة المستودعات الأساسية
             for wh in WAREHOUSES:
                 cursor.execute("SELECT * FROM warehouses WHERE name = ?", (wh['name'],))
                 if not cursor.fetchone():
@@ -332,15 +359,17 @@ class DatabaseManager:
                            VALUES (?, ?, 0, ?, ?, 1)""",
                         (wh['name'], wh['capacity'], wh['type'], wh['description'])
                     )
-
+    
     def get_app_setting(self, key, default=None):
+        """الحصول على إعداد التطبيق"""
         result = self.execute_query(
             "SELECT setting_value FROM app_settings WHERE setting_key = ?",
             (key,)
         )
         return result[0][0] if result else default
-
+    
     def update_app_setting(self, key, value, user_id=None):
+        """تحديث إعداد التطبيق"""
         with self.get_cursor() as cursor:
             cursor.execute(
                 """UPDATE app_settings 
@@ -348,49 +377,57 @@ class DatabaseManager:
                    WHERE setting_key = ?""",
                 (value, user_id, key)
             )
-
+    
     def execute_query(self, query, params=()):
+        """تنفيذ استعلام مع إرجاع النتائج"""
         with self.get_cursor() as cursor:
             cursor.execute(query, params)
             return cursor.fetchall()
-
+    
     def execute_insert(self, query, params=()):
+        """تنفيذ إدخال وإرجاع آخر ID"""
         with self.get_cursor() as cursor:
             cursor.execute(query, params)
             return cursor.lastrowid
-
+    
     def get_warehouse_count(self, warehouse_id):
+        """الحصول على عدد العربات في مستودع معين"""
         result = self.execute_query(
             "SELECT COUNT(*) FROM carts WHERE current_warehouse_id = ? AND status != 'damaged'",
             (warehouse_id,)
         )
         return result[0][0] if result else 0
-
+    
     def update_warehouse_count(self, warehouse_id):
+        """تحديث عدد العربات في المستودع"""
         count = self.get_warehouse_count(warehouse_id)
         with self.get_cursor() as cursor:
             cursor.execute(
                 "UPDATE warehouses SET current_count = ? WHERE id = ?",
                 (count, warehouse_id)
             )
-
+    
     def get_all_warehouses(self):
+        """الحصول على جميع المستودعات النشطة"""
         return self.execute_query(
             "SELECT id, name FROM warehouses WHERE is_active = 1 ORDER BY name"
         )
-
+    
     def get_user_permissions(self, user_id):
+        """الحصول على صلاحيات المستخدم"""
         result = self.execute_query(
             "SELECT * FROM user_permissions WHERE user_id = ?",
             (user_id,)
         )
+        
         if result:
             columns = ['user_id', 'can_view_dashboard', 'can_manage_carts', 'can_add_cart',
-                       'can_edit_cart', 'can_delete_cart', 'can_move_cart', 'can_view_movements',
-                       'can_manage_maintenance', 'can_complete_maintenance', 'can_view_warehouses',
-                       'can_add_warehouse', 'can_edit_warehouse', 'can_delete_warehouse',
-                       'can_view_reports', 'can_export_reports', 'can_manage_users',
-                       'can_manage_backup', 'can_change_own_password', 'updated_at']
+                      'can_edit_cart', 'can_delete_cart', 'can_move_cart', 'can_view_movements',
+                      'can_manage_maintenance', 'can_complete_maintenance', 'can_view_warehouses',
+                      'can_add_warehouse', 'can_edit_warehouse', 'can_delete_warehouse',
+                      'can_view_reports', 'can_export_reports', 'can_manage_users',
+                      'can_manage_backup', 'can_change_own_password', 'updated_at']
+            
             permissions = {}
             for i, col in enumerate(columns):
                 permissions[col] = result[0][i]
@@ -399,8 +436,9 @@ class DatabaseManager:
             permissions = DEFAULT_PERMISSIONS.copy()
             permissions['user_id'] = user_id
             return permissions
-
+    
     def update_user_permissions(self, user_id, permissions):
+        """تحديث صلاحيات المستخدم"""
         with self.get_cursor() as cursor:
             cursor.execute("SELECT * FROM user_permissions WHERE user_id = ?", (user_id,))
             if cursor.fetchone():
@@ -418,8 +456,9 @@ class DatabaseManager:
                     f"INSERT INTO user_permissions ({','.join(columns)}) VALUES ({placeholders})",
                     values
                 )
-
+    
     def log_action(self, user_id, action, description):
+        """تسجيل إجراء في سجل النظام"""
         try:
             self.execute_insert(
                 "INSERT INTO system_logs (user_id, action, description) VALUES (?, ?, ?)",
@@ -427,7 +466,6 @@ class DatabaseManager:
             )
         except:
             pass
-
 
 # ================================ تطبيق Flet الرئيسي ================================
 class CartsManagementApp:
@@ -437,320 +475,435 @@ class CartsManagementApp:
         self.current_user = None
         self.current_permissions = None
         self.backup_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "backups")
+        
+        # إنشاء مجلد النسخ الاحتياطي إذا لم يكن موجوداً
         if not os.path.exists(self.backup_dir):
             os.makedirs(self.backup_dir)
-
-        # إعداد الصفحة
-        self.page.title = self.db.get_app_setting('app_name', APP_NAME)
-        self.page.theme_mode = ft.ThemeMode.LIGHT
+        
+        # إعدادات الصفحة
+        app_name = self.db.get_app_setting('app_name', APP_NAME)
+        self.page.title = app_name
         self.page.rtl = True
+        self.page.theme_mode = ft.ThemeMode.LIGHT
         self.page.padding = 0
-        self.page.spacing = 0
-        self.page.bgcolor = COLORS['light']
-        self.page.scroll = ft.ScrollMode.ADAPTIVE
-
-        # منطقة المحتوى الرئيسية
-        self.content_column = ft.Column(spacing=0, expand=True, scroll=ft.ScrollMode.ADAPTIVE)
-
-        # بدء التشغيل
+        self.page.window_width = 1300
+        self.page.window_height = 800
+        self.page.window_min_width = 1000
+        self.page.window_min_height = 600
+        self.page.scroll = ft.ScrollMode.AUTO
+        
+        # المتغيرات العامة
+        self.content_column = None
+        self.sidebar = None
+        
+        # متغيرات البحث والفلترة
+        self.cart_search_field = None
+        self.cart_table = None
+        self.movement_search_field = None
+        self.movement_table = None
+        self.maintenance_search_field = None
+        self.maintenance_table = None
+        self.warehouse_search_field = None
+        self.warehouse_table = None
+        self.user_search_field = None
+        self.user_table = None
+        
+        # متغيرات التقارير
+        self.report_type_dropdown = None
+        self.period_dropdown = None
+        self.preview_table = None
+        
+        # متغيرات النسخ الاحتياطي
+        self.backup_progress = None
+        self.backup_status = None
+        self.backup_tree = None
+        
+        # متغيرات إعدادات MEGA
+        self.mega_status_label = None
+        
+        # عرض شاشة تسجيل الدخول
         self.show_login_screen()
-
-    # ------------------------------------------------------------
-    # دوال مساعدة عامة
-    # ------------------------------------------------------------
-    def show_snack_bar(self, message: str, color: str = COLORS['success']):
+    
+    # ================================ دوال مساعدة ================================
+    def show_snack_bar(self, message, color=COLORS['success']):
+        """عرض رسالة منبثقة"""
         self.page.snack_bar = ft.SnackBar(
-            content=ft.Text(message, color=COLORS['white']),
+            content=ft.Text(message, color=COLORS['white'], text_align=ft.TextAlign.RIGHT),
             bgcolor=color,
-            show_close_icon=True,
+            show_close_icon=True
         )
         self.page.snack_bar.open = True
         self.page.update()
-
-    def close_dialog(self, e=None):
-        if self.page.dialog:
-            self.page.dialog.open = False
-            self.page.update()
-
+    
     def check_permission(self, permission):
+        """التحقق من صلاحية المستخدم"""
         if not self.current_permissions:
             return False
-        if self.current_user['role'] == 'admin':
+        if self.current_user and self.current_user['role'] == 'admin':
             return True
         return self.current_permissions.get(permission, 0) == 1
-
-    # ------------------------------------------------------------
-    # شاشة تسجيل الدخول
-    # ------------------------------------------------------------
+    
+    def clear_content(self):
+        """مسح منطقة المحتوى"""
+        if self.content_column:
+            self.content_column.controls.clear()
+            self.page.update()
+    
+    def show_loading(self):
+        """عرض مؤشر تحميل"""
+        return ft.Container(
+            content=ft.Column([
+                ft.ProgressRing(),
+                ft.Text("جاري التحميل...", size=16, color=COLORS['gray'])
+            ], horizontal_alignment=ft.CrossAxisAlignment.CENTER),
+            alignment=ft.alignment.center,
+            expand=True
+        )
+    
+    # ================================ شاشة تسجيل الدخول ================================
     def show_login_screen(self):
+        """عرض شاشة تسجيل الدخول"""
         self.page.clean()
-        self.page.dialog = None
-
+        
         app_name = self.db.get_app_setting('app_name', APP_NAME)
         company_name = self.db.get_app_setting('company_name', 'الرئاسة العامة لشؤون المسجد الحرام والمسجد النبوي')
-
-        # البحث عن الشعار
-        logo_src = None
-        if os.path.exists(os.path.join(os.path.dirname(__file__), "assets", "logo.png")):
-            logo_src = "logo.png"
-        elif os.path.exists(os.path.join(os.path.dirname(__file__), "logo.png")):
-            logo_src = "logo.png"
-
-        self.username_input = ft.TextField(
-            label="اسم المستخدم",
-            width=300,
+        
+        # إنشاء حقول الإدخال مع المراجع
+        username_field = ft.TextField(
+            hint_text="أدخل اسم المستخدم",
+            border_radius=8,
             text_align=ft.TextAlign.RIGHT,
-            autofocus=True,
-        )
-        self.password_input = ft.TextField(
-            label="كلمة المرور",
+            bgcolor=COLORS['white'],
+            border_color=COLORS['gray'],
+            focused_border_color=COLORS['primary'],
             width=300,
+            height=45,
+            text_size=14,
+            ref=ft.Ref[ft.TextField]()
+        )
+        
+        password_field = ft.TextField(
+            hint_text="أدخل كلمة المرور",
             password=True,
             can_reveal_password=True,
+            border_radius=8,
             text_align=ft.TextAlign.RIGHT,
+            bgcolor=COLORS['white'],
+            border_color=COLORS['gray'],
+            focused_border_color=COLORS['primary'],
+            width=300,
+            height=45,
+            text_size=14,
+            ref=ft.Ref[ft.TextField]()
         )
-
+        
+        # تخزين المراجع
+        self.username_field = username_field
+        self.password_field = password_field
+        
+        # بطاقة تسجيل الدخول
         login_card = ft.Container(
             width=500,
-            padding=ft.padding.all(30),
+            height=500,
             bgcolor=COLORS['white'],
             border_radius=10,
+            border=ft.border.all(1, COLORS['gray']),
+            padding=30,
             content=ft.Column(
                 horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+                spacing=15,
                 controls=[
-                    ft.Image(src=logo_src, width=100, height=100) if logo_src else ft.Text("🚛", size=50),
-                    ft.Text(app_name, size=24, weight=ft.FontWeight.BOLD, color=COLORS['dark']),
+                    ft.Icon(name=ft.icons.LOCAL_SHIPPING, size=80, color=COLORS['dark']),
+                    ft.Text(app_name, size=22, weight=ft.FontWeight.BOLD, color=COLORS['dark']),
                     ft.Text(company_name, size=14, color=COLORS['gray']),
-                    ft.Divider(height=30, color=ft.Colors.TRANSPARENT),
-                    self.username_input,
-                    self.password_input,
+                    ft.Divider(height=20, color=ft.colors.TRANSPARENT),
+                    
+                    ft.Container(
+                        content=ft.Column([
+                            ft.Text("اسم المستخدم:", size=14, weight=ft.FontWeight.W_500, 
+                                   text_align=ft.TextAlign.RIGHT),
+                            username_field,
+                        ], spacing=5),
+                    ),
+                    
+                    ft.Container(
+                        content=ft.Column([
+                            ft.Text("كلمة المرور:", size=14, weight=ft.FontWeight.W_500,
+                                   text_align=ft.TextAlign.RIGHT),
+                            password_field,
+                        ], spacing=5),
+                    ),
+                    
+                    ft.Container(height=10),
+                    
                     ft.ElevatedButton(
-                        "تسجيل الدخول",
+                        text="تسجيل الدخول",
                         width=200,
+                        height=45,
+                        bgcolor=COLORS['success'],
+                        color=COLORS['white'],
                         style=ft.ButtonStyle(
-                            bgcolor=COLORS['success'],
-                            color=COLORS['white'],
                             shape=ft.RoundedRectangleBorder(radius=8),
                         ),
-                        on_click=self.handle_login,
+                        on_click=self.handle_login
                     ),
+                    
+                    ft.Container(height=20),
                     ft.Text("جميع الحقوق محفوظة © 2025", size=12, color=COLORS['gray']),
                 ]
             )
         )
-
-        self.page.add(
-            ft.Row(
-                [ft.Container(expand=True), login_card, ft.Container(expand=True)],
-                alignment=ft.MainAxisAlignment.CENTER,
-                vertical_alignment=ft.CrossAxisAlignment.CENTER,
-                expand=True,
-            )
+        
+        # الحاوية الرئيسية
+        main_container = ft.Container(
+            expand=True,
+            bgcolor=COLORS['light'],
+            alignment=ft.alignment.center,
+            content=login_card
         )
+        
+        self.page.add(main_container)
         self.page.update()
-
+    
     def handle_login(self, e):
-        username = self.username_input.value.strip()
-        password = self.password_input.value.strip()
+        """معالجة تسجيل الدخول"""
+        username = self.username_field.value.strip() if self.username_field.value else ""
+        password = self.password_field.value.strip() if self.password_field.value else ""
+        
         if not username or not password:
             self.show_snack_bar("الرجاء إدخال اسم المستخدم وكلمة المرور", COLORS['danger'])
             return
-
+        
         result = self.db.execute_query(
             "SELECT id, username, role, is_active FROM users WHERE username = ? AND password = ?",
             (username, password)
         )
+        
         if result:
             user_id, username, role, is_active = result[0]
+            
             if not is_active:
                 self.show_snack_bar("هذا المستخدم غير نشط. الرجاء التواصل مع المدير", COLORS['danger'])
                 return
-            self.current_user = {'id': user_id, 'username': username, 'role': role}
+            
+            self.current_user = {
+                'id': user_id,
+                'username': username,
+                'role': role
+            }
+            
             self.db.execute_query(
                 "UPDATE users SET last_login = CURRENT_TIMESTAMP WHERE id = ?",
                 (user_id,)
             )
+            
             self.current_permissions = self.db.get_user_permissions(user_id)
             self.db.log_action(user_id, 'login', f'تسجيل دخول المستخدم {username}')
             self.show_main_screen()
         else:
             self.show_snack_bar("اسم المستخدم أو كلمة المرور غير صحيحة", COLORS['danger'])
-
-    # ------------------------------------------------------------
-    # الشاشة الرئيسية والقائمة الجانبية
-    # ------------------------------------------------------------
+    
+    # ================================ الشاشة الرئيسية ================================
     def show_main_screen(self):
+        """عرض الشاشة الرئيسية"""
         self.page.clean()
-
-        app_name = self.db.get_app_setting('app_name', APP_NAME)
-        self.page.title = app_name
-
-        # بناء الشريط الجانبي
-        sidebar = self._build_sidebar()
-
-        # منطقة المحتوى
-        main_content = ft.Container(
-            content=ft.Column([
-                ft.Container(
-                    content=ft.Row([
-                        ft.Text(app_name, size=24, weight=ft.FontWeight.BOLD, color=COLORS['dark']),
-                        ft.Text(datetime.now().strftime('%Y-%m-%d %H:%M'), size=14, color=COLORS['gray']),
-                    ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
-                    padding=ft.padding.only(left=25, right=25, top=20, bottom=20),
-                    bgcolor=COLORS['light'],
-                ),
-                self.content_column,
-            ], spacing=0, expand=True),
+        
+        # الصف الرئيسي
+        main_row = ft.Row(
+            spacing=0,
+            controls=[]
+        )
+        
+        # ===== الشريط الجانبي =====
+        self.sidebar = ft.Container(
+            width=280,
+            height=self.page.window_height,
+            bgcolor=COLORS['dark'],
+            padding=ft.padding.only(top=20, bottom=20, right=20, left=20),
+            content=ft.Column(
+                horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+                spacing=5,
+                controls=[
+                    # معلومات المستخدم
+                    ft.Container(
+                        content=ft.Column([
+                            ft.Icon(name=ft.icons.LOCAL_SHIPPING, size=60, color=COLORS['white']),
+                            ft.Text(
+                                self.db.get_app_setting('app_name', APP_NAME),
+                                size=16,
+                                weight=ft.FontWeight.BOLD,
+                                color=COLORS['white'],
+                                text_align=ft.TextAlign.CENTER
+                            ),
+                            ft.Text(f"مرحباً {self.current_user['username']}", 
+                                   size=14, color=COLORS['gray']),
+                            ft.Text(
+                                "(مدير النظام)" if self.current_user['role'] == 'admin' else "",
+                                size=12, 
+                                color=COLORS['warning']
+                            ),
+                        ], horizontal_alignment=ft.CrossAxisAlignment.CENTER)
+                    ),
+                    
+                    ft.Divider(color=COLORS['gray'], height=1),
+                    
+                    # قائمة التنقل
+                    ft.Column(
+                        spacing=2,
+                        controls=self.build_menu_items(),
+                        scroll=ft.ScrollMode.AUTO,
+                    ),
+                    
+                    ft.Container(height=10),
+                    ft.Divider(color=COLORS['gray'], height=1),
+                    
+                    # زر تسجيل الخروج
+                    ft.Container(
+                        margin=ft.margin.only(top=20),
+                        content=ft.ElevatedButton(
+                            text="تسجيل الخروج",
+                            icon=ft.icons.LOGOUT,
+                            width=240,
+                            height=45,
+                            bgcolor=COLORS['danger'],
+                            color=COLORS['white'],
+                            style=ft.ButtonStyle(
+                                shape=ft.RoundedRectangleBorder(radius=8),
+                            ),
+                            on_click=self.logout
+                        )
+                    )
+                ]
+            )
+        )
+        
+        # ===== منطقة المحتوى =====
+        self.content_column = ft.Column(
+            spacing=20,
+            scroll=ft.ScrollMode.AUTO,
+            expand=True
+        )
+        
+        content_container = ft.Container(
             expand=True,
             bgcolor=COLORS['light'],
+            padding=20,
+            content=self.content_column
         )
-
-        self.page.add(
-            ft.Row([
-                sidebar,
-                main_content,
-            ], spacing=0, vertical_alignment=ft.CrossAxisAlignment.START, expand=True)
-        )
-
-        # عرض لوحة التحكم أو أول عنصر متاح
+        
+        main_row.controls.extend([content_container, self.sidebar])
+        self.page.add(main_row)
+        self.page.update()
+        
+        # عرض لوحة التحكم بشكل افتراضي
         if self.check_permission('can_view_dashboard'):
             self.show_dashboard()
-        else:
-            items = self._get_menu_items()
-            if items:
-                items[0]['action'](None)
-
-    def _build_sidebar(self):
-        logo_src = None
-        if os.path.exists(os.path.join(os.path.dirname(__file__), "assets", "logo.png")):
-            logo_src = "logo.png"
-        elif os.path.exists(os.path.join(os.path.dirname(__file__), "logo.png")):
-            logo_src = "logo.png"
-
-        self.sidebar_app_name_text = ft.Text(
-            self.db.get_app_setting('app_name', APP_NAME),
-            size=16,
-            weight=ft.FontWeight.BOLD,
-            color=COLORS['white'],
-            text_align=ft.TextAlign.CENTER,
-        )
-
-        user_info = ft.Container(
-            content=ft.Column([
-                ft.Image(src=logo_src, width=80, height=80) if logo_src else ft.Text("🚛", size=50, color=COLORS['white']),
-                self.sidebar_app_name_text,
-                ft.Text(f"مرحباً {self.current_user['username']}", size=14, color=COLORS['gray']),
-                ft.Text("(مدير النظام)" if self.current_user['role'] == 'admin' else "", size=12, color=COLORS['warning']),
-                ft.Divider(height=2, color=COLORS['gray']),
-            ], horizontal_alignment=ft.CrossAxisAlignment.CENTER, spacing=5),
-            padding=ft.padding.all(20),
-            bgcolor=COLORS['dark'],
-        )
-
-        menu_buttons = []
-        for item in self._get_menu_items():
-            btn = ft.Container(
-                content=ft.Row([
-                    ft.Text(item['icon'], size=20),
-                    ft.Text(item['text'], size=14, color=COLORS['white']),
-                ], alignment=ft.MainAxisAlignment.START, spacing=10),
-                padding=ft.padding.symmetric(horizontal=25, vertical=12),
-                ink=True,
-                on_click=item['action'],
-                border_radius=ft.border_radius.horizontal(start=30, end=0),
-            )
-            menu_buttons.append(btn)
-
-        logout_btn = ft.Container(
-            content=ft.Row([
-                ft.Text("🚪", size=20),
-                ft.Text("تسجيل الخروج", size=14, color=COLORS['white']),
-            ], alignment=ft.MainAxisAlignment.START, spacing=10),
-            padding=ft.padding.symmetric(horizontal=25, vertical=12),
-            ink=True,
-            on_click=self.logout,
-            border_radius=ft.border_radius.horizontal(start=30, end=0),
-            bgcolor=COLORS['danger'],
-        )
-
-        sidebar = ft.Container(
-            content=ft.Column([
-                user_info,
-                ft.Column(menu_buttons, spacing=2, scroll=ft.ScrollMode.AUTO, expand=True),
-                ft.Divider(height=2, color=COLORS['gray']),
-                logout_btn,
-            ], spacing=0, horizontal_alignment=ft.CrossAxisAlignment.STRETCH),
-            width=280,
-            bgcolor=COLORS['dark'],
-            padding=0,
-        )
-        return sidebar
-
-    def _get_menu_items(self):
-        items = []
-        if self.check_permission('can_view_dashboard'):
-            items.append({'icon': '📊', 'text': 'لوحة التحكم', 'action': lambda e: self.show_dashboard()})
-        if self.check_permission('can_manage_carts'):
-            items.append({'icon': '🛒', 'text': 'إدارة العربات', 'action': lambda e: self.show_cart_management()})
-        if self.check_permission('can_move_cart') or self.check_permission('can_view_movements'):
-            items.append({'icon': '🔄', 'text': 'حركة العربات', 'action': lambda e: self.show_cart_movement()})
-        if self.check_permission('can_manage_maintenance'):
-            items.append({'icon': '🔧', 'text': 'الصيانة', 'action': lambda e: self.show_maintenance()})
-        if self.check_permission('can_view_warehouses'):
-            items.append({'icon': '🏢', 'text': 'المستودعات', 'action': lambda e: self.show_warehouse_management()})
-        if self.check_permission('can_view_reports'):
-            items.append({'icon': '📈', 'text': 'التقارير', 'action': lambda e: self.show_reports()})
-        if self.current_user['role'] == 'admin' and self.check_permission('can_manage_users'):
-            items.append({'icon': '👥', 'text': 'إدارة المستخدمين', 'action': lambda e: self.show_user_management()})
-            items.append({'icon': '⚙️', 'text': 'إعدادات النظام', 'action': lambda e: self.show_system_settings()})
-        if self.current_user['role'] == 'admin' and self.check_permission('can_manage_backup'):
-            items.append({'icon': '💾', 'text': 'النسخ الاحتياطي', 'action': lambda e: self.show_backup()})
+    
+    def build_menu_items(self):
+        """بناء عناصر القائمة"""
+        menu_items = []
+        
+        menu_config = [
+            ("📊", "لوحة التحكم", self.show_dashboard, 'can_view_dashboard'),
+            ("🛒", "إدارة العربات", self.show_cart_management, 'can_manage_carts'),
+            ("🔄", "حركة العربات", self.show_cart_movement, None, ['can_move_cart', 'can_view_movements']),
+            ("🔧", "الصيانة", self.show_maintenance, 'can_manage_maintenance'),
+            ("🏢", "المستودعات", self.show_warehouse_management, 'can_view_warehouses'),
+            ("📈", "التقارير", self.show_reports, 'can_view_reports'),
+        ]
+        
+        for icon, text, handler, perm, or_perms in [(*item, None) if len(item) == 4 else item for item in menu_config]:
+            if perm:
+                if self.check_permission(perm):
+                    menu_items.append(self.create_menu_button(icon, text, handler))
+            elif or_perms:
+                if any(self.check_permission(p) for p in or_perms):
+                    menu_items.append(self.create_menu_button(icon, text, handler))
+        
+        # عناصر المدير
+        if self.current_user['role'] == 'admin':
+            if self.check_permission('can_manage_users'):
+                menu_items.append(self.create_menu_button("👥", "إدارة المستخدمين", self.show_user_management))
+                menu_items.append(self.create_menu_button("⚙️", "إعدادات النظام", self.show_system_settings))
+            
+            if self.check_permission('can_manage_backup'):
+                menu_items.append(self.create_menu_button("💾", "النسخ الاحتياطي", self.show_backup))
+        
+        # تغيير كلمة المرور
         if self.check_permission('can_change_own_password'):
-            items.append({'icon': '🔑', 'text': 'تغيير كلمة المرور', 'action': lambda e: self.show_change_password()})
-        return items
-
+            menu_items.append(self.create_menu_button("🔑", "تغيير كلمة المرور", self.show_change_password))
+        
+        return menu_items
+    
+    def create_menu_button(self, icon, text, on_click):
+        """إنشاء زر قائمة"""
+        return ft.Container(
+            width=240,
+            content=ft.TextButton(
+                content=ft.Row([
+                    ft.Text(f"{icon}  {text}", size=14, color=COLORS['white']),
+                ], alignment=ft.MainAxisAlignment.START),
+                style=ft.ButtonStyle(
+                    color=COLORS['white'],
+                    overlay_color=COLORS['primary'],
+                    padding=ft.padding.symmetric(horizontal=15, vertical=10),
+                ),
+                on_click=lambda e: on_click()
+            )
+        )
+    
     def logout(self, e):
-        def confirm(_):
-            self.page.dialog.open = False
-            self.page.update()
+        """تسجيل الخروج"""
+        def confirm_logout(e):
             if self.current_user:
                 self.db.log_action(self.current_user['id'], 'logout',
-                                   f'تسجيل خروج المستخدم {self.current_user["username"]}')
+                                  f'تسجيل خروج المستخدم {self.current_user["username"]}')
             self.current_user = None
             self.current_permissions = None
-            self.show_login_screen()
-
-        def cancel(_):
-            self.page.dialog.open = False
+            dialog.open = False
             self.page.update()
-
+            self.show_login_screen()
+        
+        def cancel_logout(e):
+            dialog.open = False
+            self.page.update()
+        
         dialog = ft.AlertDialog(
-            title=ft.Text("تسجيل الخروج", weight=ft.FontWeight.BOLD),
+            title=ft.Text("تسجيل الخروج"),
             content=ft.Text("هل أنت متأكد من تسجيل الخروج؟"),
             actions=[
-                ft.TextButton("نعم", on_click=confirm),
-                ft.TextButton("لا", on_click=cancel),
+                ft.TextButton("نعم", on_click=confirm_logout),
+                ft.TextButton("لا", on_click=cancel_logout),
             ],
             actions_alignment=ft.MainAxisAlignment.END,
         )
+        
         self.page.dialog = dialog
         dialog.open = True
         self.page.update()
-
-    def clear_content(self):
-        self.content_column.controls.clear()
-        self.page.update()
-
-    # ------------------------------------------------------------
-    # لوحة التحكم
-    # ------------------------------------------------------------
+    
+    # ================================ لوحة التحكم ================================
     def show_dashboard(self):
+        """عرض لوحة التحكم"""
         if not self.check_permission('can_view_dashboard'):
             self.show_snack_bar("غير مصرح لك بعرض لوحة التحكم", COLORS['danger'])
             return
-
+        
         self.clear_content()
-
+        
+        # عنوان الصفحة
+        self.content_column.controls.append(
+            ft.Container(
+                content=ft.Row([
+                    ft.Text("لوحة التحكم", size=24, weight=ft.FontWeight.BOLD, color=COLORS['dark']),
+                    ft.Text(datetime.now().strftime('%Y-%m-%d %H:%M'), 
+                           size=14, color=COLORS['gray']),
+                ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
+                margin=ft.margin.only(bottom=20)
+            )
+        )
+        
+        # جلب الإحصائيات
         total_carts = self.db.execute_query("SELECT COUNT(*) FROM carts")[0][0] or 0
         sound_carts = self.db.execute_query("SELECT COUNT(*) FROM carts WHERE status = 'sound'")[0][0] or 0
         maintenance_carts = self.db.execute_query("SELECT COUNT(*) FROM carts WHERE status = 'needs_maintenance'")[0][0] or 0
@@ -759,62 +912,158 @@ class CartsManagementApp:
         total_movements = self.db.execute_query("SELECT COUNT(*) FROM movements")[0][0] or 0
         pending_maintenance = self.db.execute_query("SELECT COUNT(*) FROM maintenance_records WHERE status = 'pending'")[0][0] or 0
         total_users = self.db.execute_query("SELECT COUNT(*) FROM users WHERE is_active = 1")[0][0] or 0
-
-        def card(icon, title, value, color, subtitle):
-            return ft.Container(
-                content=ft.Column([
-                    ft.Row([
-                        ft.Text(icon, size=30),
-                        ft.Text(title, size=14, color=COLORS['gray']),
-                    ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
-                    ft.Text(value, size=28, weight=ft.FontWeight.BOLD, color=color),
-                    ft.Text(subtitle, size=11, color=COLORS['gray']),
-                ]),
-                padding=15,
-                bgcolor=COLORS['white'],
-                border_radius=10,
-                expand=True,
-            )
-
-        cards_row1 = ft.Row([
-            card("🚛", "إجمالي العربات", f"{total_carts:,}", COLORS['primary'],
-                 f"زيادة 12% عن الشهر الماضي"),
-            card("✅", "عربات سليمة", f"{sound_carts:,}", COLORS['success'],
-                 f"{sound_carts / total_carts * 100:.1f}% من الإجمالي" if total_carts > 0 else "0%"),
-            card("🔧", "تحتاج صيانة", f"{maintenance_carts:,}", COLORS['warning'],
-                 f"{maintenance_carts / total_carts * 100:.1f}% من الإجمالي" if total_carts > 0 else "0%"),
-            card("⚠️", "عربات تالفة", f"{damaged_carts:,}", COLORS['danger'],
-                 f"{damaged_carts / total_carts * 100:.1f}% من الإجمالي" if total_carts > 0 else "0%"),
-        ], alignment=ft.MainAxisAlignment.SPACE_EVENLY, spacing=10)
-
-        cards_row2 = ft.Row([
-            card("🏢", "المستودعات", f"{total_warehouses:,}", COLORS['purple'], "مستودع نشط"),
-            card("🔄", "حركات اليوم", f"{total_movements:,}", COLORS['info'], "آخر 24 ساعة"),
-            card("🔧", "بانتظار الصيانة", f"{pending_maintenance:,}", COLORS['orange'], f"{pending_maintenance} عربة"),
-            card("👥", "المستخدمين", f"{total_users:,}", COLORS['teal'], f"{total_users} مستخدم نشط"),
-        ], alignment=ft.MainAxisAlignment.SPACE_EVENLY, spacing=10)
-
+        
+        # بطاقات الإحصائيات - الصف الأول
+        stats_row1 = ft.ResponsiveRow(
+            spacing=10,
+            controls=[
+                self.create_stat_card("🚛", "إجمالي العربات", total_carts, COLORS['primary'],
+                                     f"زيادة 12% عن الشهر الماضي", col={"sm": 6, "md": 3, "lg": 3}),
+                self.create_stat_card("✅", "عربات سليمة", sound_carts, COLORS['success'],
+                                     f"{sound_carts/total_carts*100:.1f}% من الإجمالي" if total_carts > 0 else "0%", 
+                                     col={"sm": 6, "md": 3, "lg": 3}),
+                self.create_stat_card("🔧", "تحتاج صيانة", maintenance_carts, COLORS['warning'],
+                                     f"{maintenance_carts/total_carts*100:.1f}% من الإجمالي" if total_carts > 0 else "0%", 
+                                     col={"sm": 6, "md": 3, "lg": 3}),
+                self.create_stat_card("⚠️", "عربات تالفة", damaged_carts, COLORS['danger'],
+                                     f"{damaged_carts/total_carts*100:.1f}% من الإجمالي" if total_carts > 0 else "0%", 
+                                     col={"sm": 6, "md": 3, "lg": 3}),
+            ]
+        )
+        
+        # بطاقات الإحصائيات - الصف الثاني
+        stats_row2 = ft.ResponsiveRow(
+            spacing=10,
+            controls=[
+                self.create_stat_card("🏢", "المستودعات", total_warehouses, COLORS['purple'], 
+                                     "مستودع نشط", col={"sm": 6, "md": 3, "lg": 3}),
+                self.create_stat_card("🔄", "حركات اليوم", total_movements, COLORS['info'], 
+                                     "آخر 24 ساعة", col={"sm": 6, "md": 3, "lg": 3}),
+                self.create_stat_card("🔧", "بانتظار الصيانة", pending_maintenance, COLORS['orange'], 
+                                     f"{pending_maintenance} عربة", col={"sm": 6, "md": 3, "lg": 3}),
+                self.create_stat_card("👥", "المستخدمين", total_users, COLORS['teal'], 
+                                     f"{total_users} مستخدم نشط", col={"sm": 6, "md": 3, "lg": 3}),
+            ]
+        )
+        
+        self.content_column.controls.append(stats_row1)
+        self.content_column.controls.append(ft.Container(height=10))
+        self.content_column.controls.append(stats_row2)
+        self.content_column.controls.append(ft.Container(height=20))
+        
+        # حالة المستودعات وآخر الحركات
+        charts_row = ft.ResponsiveRow(
+            spacing=10,
+            controls=[
+                ft.Container(
+                    col={"sm": 12, "md": 6, "lg": 6},
+                    bgcolor=COLORS['white'],
+                    border_radius=10,
+                    border=ft.border.all(1, COLORS['gray']),
+                    padding=15,
+                    content=ft.Column([
+                        ft.Text("حالة المستودعات", size=18, weight=ft.FontWeight.BOLD, color=COLORS['dark']),
+                        ft.Divider(height=1, color=COLORS['light']),
+                        ft.Column(
+                            spacing=15,
+                            controls=self.get_warehouse_status_cards()
+                        )
+                    ])
+                ),
+                
+                ft.Container(
+                    col={"sm": 12, "md": 6, "lg": 6},
+                    bgcolor=COLORS['white'],
+                    border_radius=10,
+                    border=ft.border.all(1, COLORS['gray']),
+                    padding=15,
+                    content=ft.Column([
+                        ft.Text("آخر الحركات", size=18, weight=ft.FontWeight.BOLD, color=COLORS['dark']),
+                        ft.Divider(height=1, color=COLORS['light']),
+                        ft.Column(
+                            spacing=10,
+                            controls=self.get_recent_movements()
+                        )
+                    ])
+                )
+            ]
+        )
+        
+        self.content_column.controls.append(charts_row)
+        self.page.update()
+    
+    def create_stat_card(self, icon, title, value, color, subtitle, col=None):
+        """إنشاء بطاقة إحصائية"""
+        card = ft.Container(
+            bgcolor=COLORS['white'],
+            border_radius=10,
+            border=ft.border.all(1, COLORS['gray']),
+            padding=15,
+            content=ft.Column([
+                ft.Row([
+                    ft.Text(icon, size=30),
+                    ft.Text(title, size=14, color=COLORS['gray']),
+                ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
+                ft.Container(height=5),
+                ft.Text(f"{value:,}", size=24, weight=ft.FontWeight.BOLD, color=color),
+                ft.Text(subtitle, size=11, color=COLORS['gray']),
+            ])
+        )
+        
+        if col:
+            card.col = col
+        
+        return card
+    
+    def get_warehouse_status_cards(self):
+        """الحصول على بطاقات حالة المستودعات"""
+        cards = []
         warehouses = self.db.execute_query(
             "SELECT name, capacity, current_count FROM warehouses WHERE is_active = 1 ORDER BY id LIMIT 5"
         )
-        wh_list = ft.Column(spacing=10)
+        
         for wh in warehouses:
             name, capacity, current = wh
             percentage = (current / capacity * 100) if capacity > 0 else 0
-            color = COLORS['danger'] if percentage >= 90 else COLORS['warning'] if percentage >= 70 else COLORS['success']
-            wh_list.controls.append(
-                ft.Column([
-                    ft.Row([ft.Text(name, size=14, weight=ft.FontWeight.BOLD)]),
-                    ft.ProgressBar(value=percentage / 100, color=color, bgcolor=COLORS['light'], height=8),
-                    ft.Row([
-                        ft.Text(f"{percentage:.1f}%", size=12, weight=ft.FontWeight.BOLD, color=color),
-                        ft.Text(f"{current} / {capacity}", size=12, color=COLORS['gray']),
-                    ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
-                    ft.Divider(height=1, color=COLORS['light']),
-                ], spacing=5)
+            
+            if percentage >= 90:
+                color = COLORS['danger']
+            elif percentage >= 70:
+                color = COLORS['warning']
+            else:
+                color = COLORS['success']
+            
+            cards.append(
+                ft.Container(
+                    content=ft.Column([
+                        ft.Row([
+                            ft.Text(name, size=14, weight=ft.FontWeight.BOLD, color=COLORS['dark']),
+                            ft.Text(f"{percentage:.1f}%", size=14, weight=ft.FontWeight.BOLD, color=color),
+                        ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
+                        ft.Container(
+                            height=8,
+                            bgcolor=COLORS['light'],
+                            border_radius=4,
+                            content=ft.Container(
+                                width=max(percentage * 2, 5),
+                                height=8,
+                                bgcolor=color,
+                                border_radius=4,
+                            )
+                        ),
+                        ft.Row([
+                            ft.Text(f"{current} / {capacity}", size=12, color=COLORS['gray']),
+                        ], alignment=ft.MainAxisAlignment.END),
+                    ])
+                )
             )
-
-        movements = self.db.execute_query("""
+        
+        return cards
+    
+    def get_recent_movements(self):
+        """الحصول على آخر الحركات"""
+        movements = []
+        data = self.db.execute_query("""
             SELECT c.serial_number, w1.name, w2.name, m.timestamp
             FROM movements m
             JOIN carts c ON m.cart_id = c.id
@@ -823,372 +1072,504 @@ class CartsManagementApp:
             ORDER BY m.timestamp DESC
             LIMIT 8
         """)
-        mov_list = ft.Column(spacing=10)
-        for m in movements:
-            serial, from_wh, to_wh, ts = m
-            mov_list.controls.append(
+        
+        for m in data:
+            serial, from_wh, to_wh, timestamp = m
+            movements.append(
                 ft.Container(
                     content=ft.Column([
-                        ft.Text(f"🚛 {serial}", size=14, weight=ft.FontWeight.BOLD),
+                        ft.Row([
+                            ft.Text(f"🚛 {serial}", size=13, weight=ft.FontWeight.BOLD, color=COLORS['dark']),
+                            ft.Text(timestamp[:16] if timestamp else "", size=11, color=COLORS['gray']),
+                        ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
                         ft.Text(f"{from_wh or '—'}  ←  {to_wh}", size=12, color=COLORS['primary']),
-                        ft.Text(ts[:16] if ts else "", size=11, color=COLORS['gray']),
-                    ]),
-                    padding=8,
-                    border=ft.border.all(1, COLORS['light']),
-                    border_radius=8,
+                        ft.Divider(height=1, color=COLORS['light']),
+                    ])
                 )
             )
-
-        self.content_column.controls.extend([
-            ft.Container(padding=ft.padding.only(left=25, right=25, top=10, bottom=10), content=cards_row1),
-            ft.Container(padding=ft.padding.only(left=25, right=25, top=5, bottom=10), content=cards_row2),
-            ft.Container(
-                padding=ft.padding.only(left=25, right=25, top=20, bottom=20),
-                content=ft.Row([
-                    ft.Container(
-                        content=ft.Column([
-                            ft.Text("حالة المستودعات", size=18, weight=ft.FontWeight.BOLD),
-                            wh_list,
-                        ], scroll=ft.ScrollMode.AUTO),
-                        padding=15,
-                        bgcolor=COLORS['white'],
-                        border_radius=10,
-                        expand=True,
-                    ),
-                    ft.Container(width=20),
-                    ft.Container(
-                        content=ft.Column([
-                            ft.Text("آخر الحركات", size=18, weight=ft.FontWeight.BOLD),
-                            mov_list,
-                        ], scroll=ft.ScrollMode.AUTO),
-                        padding=15,
-                        bgcolor=COLORS['white'],
-                        border_radius=10,
-                        expand=True,
-                    ),
-                ]),
-            ),
-        ])
-        self.page.update()
-
-    # ------------------------------------------------------------
-    # إدارة العربات (مكتملة)
-    # ------------------------------------------------------------
+        
+        return movements if movements else [ft.Text("لا توجد حركات", size=14, color=COLORS['gray'])]
+    
+    # ================================ إدارة العربات ================================
     def show_cart_management(self):
+        """عرض صفحة إدارة العربات"""
         if not self.check_permission('can_manage_carts'):
             self.show_snack_bar("غير مصرح لك بإدارة العربات", COLORS['danger'])
             return
-
+        
         self.clear_content()
-
-        self.cart_search_field = ft.TextField(
-            hint_text="🔍 بحث",
-            width=250,
-            on_change=self.filter_carts,
-        )
-        header = ft.Row([
+        
+        # عنوان الصفحة
+        title_row = ft.Row([
             ft.Text("إدارة العربات", size=24, weight=ft.FontWeight.BOLD, color=COLORS['dark']),
             ft.Row([
-                self.cart_search_field,
-                ft.ElevatedButton(
-                    "➕ إضافة عربة جديدة",
-                    icon=ft.icons.ADD,
-                    style=ft.ButtonStyle(bgcolor=COLORS['success'], color=COLORS['white']),
-                    visible=self.check_permission('can_add_cart'),
-                    on_click=lambda e: self._add_cart_dialog(),
+                ft.TextField(
+                    hint_text="بحث...",
+                    width=250,
+                    height=40,
+                    border_radius=8,
+                    text_align=ft.TextAlign.RIGHT,
+                    prefix=ft.Icon(ft.icons.SEARCH),
+                    on_change=self.filter_carts,
+                    ref=ft.Ref[ft.TextField]()
                 ),
-            ]),
+                ft.ElevatedButton(
+                    text="إضافة عربة جديدة",
+                    icon=ft.icons.ADD,
+                    bgcolor=COLORS['success'],
+                    color=COLORS['white'],
+                    style=ft.ButtonStyle(
+                        shape=ft.RoundedRectangleBorder(radius=8),
+                    ),
+                    on_click=self.show_add_cart_dialog,
+                    visible=self.check_permission('can_add_cart')
+                ),
+            ])
         ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN)
-
+        
+        self.content_column.controls.append(title_row)
+        self.content_column.controls.append(ft.Container(height=20))
+        
+        # تخزين مرجع حقل البحث
+        self.cart_search_field = title_row.controls[1].controls[0]
+        
+        # جدول العربات
         self.cart_table = ft.DataTable(
             columns=[
-                ft.DataColumn(ft.Text("رقم العربة")),
-                ft.DataColumn(ft.Text("الرقم التسلسلي")),
-                ft.DataColumn(ft.Text("الحالة")),
-                ft.DataColumn(ft.Text("المستودع الحالي")),
-                ft.DataColumn(ft.Text("آخر تحديث")),
-                ft.DataColumn(ft.Text("الإجراءات")),
+                ft.DataColumn(ft.Text("الرقم", size=14, weight=ft.FontWeight.BOLD)),
+                ft.DataColumn(ft.Text("الرقم التسلسلي", size=14, weight=ft.FontWeight.BOLD)),
+                ft.DataColumn(ft.Text("الحالة", size=14, weight=ft.FontWeight.BOLD)),
+                ft.DataColumn(ft.Text("المستودع الحالي", size=14, weight=ft.FontWeight.BOLD)),
+                ft.DataColumn(ft.Text("آخر تحديث", size=14, weight=ft.FontWeight.BOLD)),
+                ft.DataColumn(ft.Text("الإجراءات", size=14, weight=ft.FontWeight.BOLD)),
             ],
             rows=[],
-            border=ft.border.all(1, COLORS['gray']),
-            border_radius=10,
-            vertical_lines=ft.border.BorderSide(1, COLORS['light']),
-            horizontal_lines=ft.border.BorderSide(1, COLORS['light']),
-            column_spacing=20,
-            data_row_max_height=60,
+            horizontal_margin=10,
+            column_spacing=30,
+            heading_row_color=COLORS['light'],
+            heading_row_height=50,
+            data_row_max_height=50,
+            expand=True
         )
-
-        self.content_column.controls.extend([
-            ft.Container(content=header, padding=ft.padding.only(left=25, right=25, top=20, bottom=10)),
-            ft.Container(
-                content=ft.Column([
-                    ft.Container(
-                        content=self.cart_table,
-                        padding=10,
-                        bgcolor=COLORS['white'],
-                        border_radius=10,
-                        expand=True,
-                    )
-                ], scroll=ft.ScrollMode.AUTO, expand=True),
-                padding=ft.padding.only(left=25, right=25, bottom=20),
-                expand=True,
-            ),
-        ])
-
-        self._load_carts()
-
-    def _load_carts(self, search=""):
-        if search:
-            carts = self.db.execute_query("""
-                SELECT c.id, c.serial_number, c.status, w.name, c.last_updated
-                FROM carts c
-                LEFT JOIN warehouses w ON c.current_warehouse_id = w.id
-                WHERE c.id LIKE ? OR c.serial_number LIKE ?
-                ORDER BY c.id DESC
-            """, (f'%{search}%', f'%{search}%'))
-        else:
-            carts = self.db.execute_query("""
-                SELECT c.id, c.serial_number, c.status, w.name, c.last_updated
-                FROM carts c
-                LEFT JOIN warehouses w ON c.current_warehouse_id = w.id
-                ORDER BY c.id DESC
-            """)
-
-        rows = []
+        
+        # حاوية الجدول مع التمرير
+        table_container = ft.Container(
+            content=ft.Column([
+                self.cart_table
+            ], scroll=ft.ScrollMode.AUTO),
+            expand=True,
+            bgcolor=COLORS['white'],
+            border_radius=10,
+            border=ft.border.all(1, COLORS['gray']),
+            padding=15
+        )
+        
+        self.content_column.controls.append(table_container)
+        self.load_carts()
+        self.page.update()
+    
+    def load_carts(self):
+        """تحميل قائمة العربات"""
+        if not self.cart_table:
+            return
+        
+        self.cart_table.rows.clear()
+        
+        carts = self.db.execute_query("""
+            SELECT c.id, c.serial_number, c.status, w.name, c.last_updated
+            FROM carts c
+            LEFT JOIN warehouses w ON c.current_warehouse_id = w.id
+            ORDER BY c.id DESC
+        """)
+        
         for cart in carts:
             cart_id, serial, status, warehouse, updated = cart
             status_text = CART_STATUS.get(status, status)
-            status_color = {
-                'sound': COLORS['success'],
-                'needs_maintenance': COLORS['warning'],
-                'damaged': COLORS['danger']
-            }.get(status, COLORS['gray'])
-
-            actions = ft.Row(spacing=5)
-            if self.check_permission('can_edit_cart'):
-                actions.controls.append(
-                    ft.IconButton(
-                        icon=ft.icons.EDIT,
-                        icon_size=18,
-                        icon_color=COLORS['white'],
-                        bgcolor=COLORS['primary'],
-                        tooltip="تعديل",
-                        on_click=lambda e, cid=cart_id, s=serial: self._edit_cart_dialog(cid, s),
-                    )
-                )
-            if self.check_permission('can_delete_cart'):
-                actions.controls.append(
-                    ft.IconButton(
-                        icon=ft.icons.DELETE,
-                        icon_size=18,
-                        icon_color=COLORS['white'],
-                        bgcolor=COLORS['danger'],
-                        tooltip="حذف",
-                        on_click=lambda e, cid=cart_id: self._delete_cart_confirm(cid),
-                    )
-                )
-
-            rows.append(
+            
+            # تحديد لون الصف حسب الحالة
+            row_color = None
+            if status == 'sound':
+                row_color = ft.colors.with_opacity(0.1, COLORS['success'])
+            elif status == 'needs_maintenance':
+                row_color = ft.colors.with_opacity(0.1, COLORS['warning'])
+            elif status == 'damaged':
+                row_color = ft.colors.with_opacity(0.1, COLORS['danger'])
+            
+            # أزرار الإجراءات
+            actions_row = ft.Row([
+                ft.IconButton(
+                    icon=ft.icons.EDIT,
+                    icon_size=18,
+                    icon_color=COLORS['primary'],
+                    tooltip="تعديل",
+                    on_click=lambda e, cid=cart_id, s=serial: self.edit_cart(cid, s),
+                    visible=self.check_permission('can_edit_cart')
+                ),
+                ft.IconButton(
+                    icon=ft.icons.DELETE,
+                    icon_size=18,
+                    icon_color=COLORS['danger'],
+                    tooltip="حذف",
+                    on_click=lambda e, cid=cart_id: self.delete_cart(cid),
+                    visible=self.check_permission('can_delete_cart')
+                ),
+            ], spacing=5)
+            
+            self.cart_table.rows.append(
                 ft.DataRow(
                     cells=[
-                        ft.DataCell(ft.Text(str(cart_id))),
-                        ft.DataCell(ft.Text(serial)),
+                        ft.DataCell(ft.Text(str(cart_id), size=13)),
+                        ft.DataCell(ft.Text(serial, size=13)),
                         ft.DataCell(ft.Container(
-                            content=ft.Text(status_text),
-                            bgcolor=status_color + '20',
-                            padding=ft.padding.symmetric(horizontal=8, vertical=2),
-                            border_radius=12,
+                            content=ft.Text(status_text, size=13, color=COLORS['white']),
+                            bgcolor=COLORS['success'] if status == 'sound' else 
+                                   COLORS['warning'] if status == 'needs_maintenance' else 
+                                   COLORS['danger'],
+                            padding=ft.padding.symmetric(horizontal=8, vertical=4),
+                            border_radius=4
                         )),
-                        ft.DataCell(ft.Text(warehouse or "غير محدد")),
-                        ft.DataCell(ft.Text(updated[:10] if updated else "")),
-                        ft.DataCell(actions),
-                    ]
+                        ft.DataCell(ft.Text(warehouse or "غير محدد", size=13)),
+                        ft.DataCell(ft.Text(updated[:10] if updated else "", size=13)),
+                        ft.DataCell(actions_row),
+                    ],
+                    color=row_color
                 )
             )
-        self.cart_table.rows = rows
+        
         self.page.update()
-
+    
     def filter_carts(self, e):
-        self._load_carts(self.cart_search_field.value.strip())
-
-    def _add_cart_dialog(self):
+        """فلترة العربات حسب البحث"""
+        if not self.cart_table:
+            return
+        
+        search_text = e.control.value.strip().lower() if e.control.value else ""
+        
+        for row in self.cart_table.rows[:]:
+            values = []
+            for cell in row.cells[:4]:  # الأعمدة الأولى فقط
+                if isinstance(cell.content, ft.Text):
+                    values.append(cell.content.value.lower())
+                elif isinstance(cell.content, ft.Container):
+                    if isinstance(cell.content.content, ft.Text):
+                        values.append(cell.content.content.value.lower())
+            
+            if search_text:
+                if not any(search_text in val for val in values):
+                    self.cart_table.rows.remove(row)
+            else:
+                # إعادة تحميل الجدول بالكامل إذا كان البحث فارغاً
+                self.cart_table.rows.clear()
+                self.load_carts()
+                break
+        
+        self.page.update()
+    
+    def show_add_cart_dialog(self, e):
+        """عرض نافذة إضافة عربة جديدة"""
+        if not self.check_permission('can_add_cart'):
+            self.show_snack_bar("غير مصرح لك بإضافة عربات جديدة", COLORS['danger'])
+            return
+        
+        # جلب قائمة المستودعات
         warehouses = self.db.get_all_warehouses()
         warehouse_options = [w[1] for w in warehouses]
-        warehouse_dict = {w[1]: w[0] for w in warehouses}
-
-        serial_field = ft.TextField(label="الرقم التسلسلي", width=350, autofocus=True)
+        
+        # حقول الإدخال
+        serial_field = ft.TextField(
+            label="الرقم التسلسلي",
+            width=300,
+            border_radius=8,
+            text_align=ft.TextAlign.RIGHT,
+            autofocus=True
+        )
+        
         status_dropdown = ft.Dropdown(
             label="الحالة",
-            width=350,
-            options=[ft.dropdown.Option("سليمة"), ft.dropdown.Option("تحتاج صيانة"), ft.dropdown.Option("تالفة")],
-            value="سليمة",
+            width=300,
+            options=[
+                ft.dropdown.Option("سليمة"),
+                ft.dropdown.Option("تحتاج صيانة"),
+                ft.dropdown.Option("تالفة"),
+            ],
+            value="سليمة"
         )
+        
         warehouse_dropdown = ft.Dropdown(
             label="المستودع",
-            width=350,
-            options=[ft.dropdown.Option(n) for n in warehouse_options],
+            width=300,
+            options=[ft.dropdown.Option(name) for name in warehouse_options] if warehouse_options else [],
+            value=warehouse_options[0] if warehouse_options else None
         )
-        notes_field = ft.TextField(label="ملاحظات", width=350, multiline=True, min_lines=3, max_lines=5)
-
-        def save(e):
-            serial = serial_field.value.strip()
+        
+        notes_field = ft.TextField(
+            label="ملاحظات",
+            width=300,
+            multiline=True,
+            min_lines=3,
+            max_lines=5,
+            text_align=ft.TextAlign.RIGHT
+        )
+        
+        def save_cart(e):
+            serial = serial_field.value.strip() if serial_field.value else ""
             status_text = status_dropdown.value
             warehouse_name = warehouse_dropdown.value
-            notes = notes_field.value
+            notes = notes_field.value or ""
+            
             if not serial:
                 self.show_snack_bar("الرجاء إدخال الرقم التسلسلي", COLORS['danger'])
                 return
-            status_map = {"سليمة": 'sound', "تحتاج صيانة": 'needs_maintenance', "تالفة": 'damaged'}
+            
+            status_map = {
+                "سليمة": 'sound',
+                "تحتاج صيانة": 'needs_maintenance',
+                "تالفة": 'damaged'
+            }
             status = status_map.get(status_text, 'sound')
-            warehouse_id = warehouse_dict.get(warehouse_name) if warehouse_name else None
+            
+            warehouse_id = None
+            for w in warehouses:
+                if w[1] == warehouse_name:
+                    warehouse_id = w[0]
+                    break
+            
             try:
                 cart_id = self.db.execute_insert(
-                    """INSERT INTO carts (serial_number, status, current_warehouse_id, created_by, notes) 
+                    """INSERT INTO carts 
+                       (serial_number, status, current_warehouse_id, created_by, notes) 
                        VALUES (?, ?, ?, ?, ?)""",
                     (serial, status, warehouse_id, self.current_user['id'], notes)
                 )
+                
                 if warehouse_id:
                     self.db.update_warehouse_count(warehouse_id)
-                self.db.log_action(self.current_user['id'], 'add_cart', f'إضافة عربة جديدة رقم {serial}')
-                self.close_dialog()
+                
+                self.db.log_action(self.current_user['id'], 'add_cart',
+                                  f'إضافة عربة جديدة رقم {serial}')
+                
+                dialog.open = False
+                self.page.update()
                 self.show_snack_bar("تم إضافة العربة بنجاح", COLORS['success'])
-                self._load_carts()
+                self.load_carts()
+                
             except sqlite3.IntegrityError:
                 self.show_snack_bar("الرقم التسلسلي موجود مسبقاً", COLORS['danger'])
-
+        
         dialog = ft.AlertDialog(
-            title=ft.Text("إضافة عربة جديدة", weight=ft.FontWeight.BOLD),
+            title=ft.Text("إضافة عربة جديدة", size=18, weight=ft.FontWeight.BOLD),
             content=ft.Container(
-                content=ft.Column([serial_field, status_dropdown, warehouse_dropdown, notes_field],
-                                  width=400, spacing=15, scroll=ft.ScrollMode.AUTO),
-                padding=10,
+                width=350,
+                content=ft.Column([
+                    serial_field,
+                    status_dropdown,
+                    warehouse_dropdown,
+                    notes_field,
+                ], spacing=15, scroll=ft.ScrollMode.AUTO),
+                padding=10
             ),
             actions=[
-                ft.TextButton("حفظ", on_click=save),
-                ft.TextButton("إلغاء", on_click=self.close_dialog),
+                ft.TextButton("إلغاء", on_click=lambda e: self.close_dialog(dialog)),
+                ft.ElevatedButton("حفظ", on_click=save_cart, bgcolor=COLORS['success'], color=COLORS['white']),
             ],
             actions_alignment=ft.MainAxisAlignment.END,
         )
+        
         self.page.dialog = dialog
         dialog.open = True
         self.page.update()
-
-    def _edit_cart_dialog(self, cart_id, serial):
+    
+    def edit_cart(self, cart_id, serial):
+        """تعديل بيانات العربة"""
+        if not self.check_permission('can_edit_cart'):
+            self.show_snack_bar("غير مصرح لك بتعديل العربات", COLORS['danger'])
+            return
+        
         result = self.db.execute_query("""
             SELECT c.status, w.name, c.notes
             FROM carts c
             LEFT JOIN warehouses w ON c.current_warehouse_id = w.id
             WHERE c.id = ?
         """, (cart_id,))
+        
         if not result:
             self.show_snack_bar("العربة غير موجودة", COLORS['danger'])
             return
+        
         status, warehouse, notes = result[0]
         status_text = CART_STATUS.get(status, status)
-
+        
+        # جلب قائمة المستودعات
         warehouses = self.db.get_all_warehouses()
         warehouse_options = [w[1] for w in warehouses]
-        warehouse_dict = {w[1]: w[0] for w in warehouses}
-
-        serial_display = ft.TextField(label="الرقم التسلسلي", width=350, value=serial, read_only=True)
+        
+        # حقول الإدخال
+        serial_display = ft.TextField(
+            label="الرقم التسلسلي",
+            width=300,
+            value=serial,
+            read_only=True,
+            border_radius=8,
+            text_align=ft.TextAlign.RIGHT
+        )
+        
         status_dropdown = ft.Dropdown(
             label="الحالة",
-            width=350,
-            options=[ft.dropdown.Option("سليمة"), ft.dropdown.Option("تحتاج صيانة"), ft.dropdown.Option("تالفة")],
-            value=status_text,
+            width=300,
+            options=[
+                ft.dropdown.Option("سليمة"),
+                ft.dropdown.Option("تحتاج صيانة"),
+                ft.dropdown.Option("تالفة"),
+            ],
+            value=status_text
         )
+        
         warehouse_dropdown = ft.Dropdown(
             label="المستودع",
-            width=350,
-            options=[ft.dropdown.Option(n) for n in warehouse_options],
-            value=warehouse if warehouse else None,
+            width=300,
+            options=[ft.dropdown.Option(name) for name in warehouse_options] if warehouse_options else [],
+            value=warehouse or (warehouse_options[0] if warehouse_options else None)
         )
-        notes_field = ft.TextField(label="ملاحظات", width=350, value=notes or "", multiline=True, min_lines=3, max_lines=5)
-
-        def save(e):
+        
+        notes_field = ft.TextField(
+            label="ملاحظات",
+            width=300,
+            value=notes or "",
+            multiline=True,
+            min_lines=3,
+            max_lines=5,
+            text_align=ft.TextAlign.RIGHT
+        )
+        
+        def save_edit(e):
             new_status_text = status_dropdown.value
             new_warehouse_name = warehouse_dropdown.value
-            new_notes = notes_field.value
-            status_map = {"سليمة": 'sound', "تحتاج صيانة": 'needs_maintenance', "تالفة": 'damaged'}
+            new_notes = notes_field.value or ""
+            
+            status_map = {
+                "سليمة": 'sound',
+                "تحتاج صيانة": 'needs_maintenance',
+                "تالفة": 'damaged'
+            }
             new_status = status_map.get(new_status_text, 'sound')
-            new_warehouse_id = warehouse_dict.get(new_warehouse_name) if new_warehouse_name else None
+            
+            new_warehouse_id = None
+            for w in warehouses:
+                if w[1] == new_warehouse_name:
+                    new_warehouse_id = w[0]
+                    break
+            
             old_warehouse = self.db.execute_query(
-                "SELECT current_warehouse_id FROM carts WHERE id = ?", (cart_id,)
+                "SELECT current_warehouse_id FROM carts WHERE id = ?",
+                (cart_id,)
             )[0][0]
+            
             self.db.execute_query(
-                """UPDATE carts SET status = ?, current_warehouse_id = ?, last_updated = CURRENT_TIMESTAMP, notes = ? 
+                """UPDATE carts 
+                   SET status = ?, current_warehouse_id = ?, last_updated = CURRENT_TIMESTAMP, notes = ? 
                    WHERE id = ?""",
                 (new_status, new_warehouse_id, new_notes, cart_id)
             )
+            
             if old_warehouse:
                 self.db.update_warehouse_count(old_warehouse)
             if new_warehouse_id:
                 self.db.update_warehouse_count(new_warehouse_id)
-            self.db.log_action(self.current_user['id'], 'edit_cart', f'تعديل العربة رقم {serial}')
-            self.close_dialog()
+            
+            self.db.log_action(self.current_user['id'], 'edit_cart',
+                              f'تعديل العربة رقم {serial}')
+            
+            dialog.open = False
+            self.page.update()
             self.show_snack_bar("تم تعديل العربة بنجاح", COLORS['success'])
-            self._load_carts()
-
+            self.load_carts()
+        
         dialog = ft.AlertDialog(
-            title=ft.Text(f"تعديل العربة: {serial}", weight=ft.FontWeight.BOLD),
+            title=ft.Text(f"تعديل العربة: {serial}", size=18, weight=ft.FontWeight.BOLD),
             content=ft.Container(
-                content=ft.Column([serial_display, status_dropdown, warehouse_dropdown, notes_field],
-                                  width=400, spacing=15, scroll=ft.ScrollMode.AUTO),
-                padding=10,
+                width=350,
+                content=ft.Column([
+                    serial_display,
+                    status_dropdown,
+                    warehouse_dropdown,
+                    notes_field,
+                ], spacing=15, scroll=ft.ScrollMode.AUTO),
+                padding=10
             ),
             actions=[
-                ft.TextButton("حفظ", on_click=save),
-                ft.TextButton("إلغاء", on_click=self.close_dialog),
+                ft.TextButton("إلغاء", on_click=lambda e: self.close_dialog(dialog)),
+                ft.ElevatedButton("حفظ", on_click=save_edit, bgcolor=COLORS['success'], color=COLORS['white']),
             ],
             actions_alignment=ft.MainAxisAlignment.END,
         )
+        
         self.page.dialog = dialog
         dialog.open = True
         self.page.update()
-
-    def _delete_cart_confirm(self, cart_id):
-        def confirm(e):
+    
+    def delete_cart(self, cart_id):
+        """حذف عربة"""
+        if not self.check_permission('can_delete_cart'):
+            self.show_snack_bar("غير مصرح لك بحذف العربات", COLORS['danger'])
+            return
+        
+        def confirm_delete(e):
             result = self.db.execute_query(
                 "SELECT current_warehouse_id, serial_number FROM carts WHERE id = ?",
                 (cart_id,)
             )
+            
             if result:
-                wh_id, serial = result[0]
+                warehouse_id, serial = result[0]
                 self.db.execute_query("DELETE FROM carts WHERE id = ?", (cart_id,))
-                if wh_id:
-                    self.db.update_warehouse_count(wh_id)
-                self.db.log_action(self.current_user['id'], 'delete_cart', f'حذف العربة رقم {serial}')
-            self.close_dialog()
-            self.show_snack_bar("تم حذف العربة بنجاح", COLORS['success'])
-            self._load_carts()
-
+                
+                if warehouse_id:
+                    self.db.update_warehouse_count(warehouse_id)
+                
+                self.db.log_action(self.current_user['id'], 'delete_cart',
+                                  f'حذف العربة رقم {serial}')
+                
+                dialog.open = False
+                self.page.update()
+                self.show_snack_bar("تم حذف العربة بنجاح", COLORS['success'])
+                self.load_carts()
+        
+        def cancel_delete(e):
+            dialog.open = False
+            self.page.update()
+        
         dialog = ft.AlertDialog(
-            title=ft.Text("تأكيد الحذف", weight=ft.FontWeight.BOLD),
+            title=ft.Text("تأكيد الحذف"),
             content=ft.Text("هل أنت متأكد من حذف هذه العربة؟"),
             actions=[
-                ft.TextButton("نعم", on_click=confirm),
-                ft.TextButton("لا", on_click=self.close_dialog),
+                ft.TextButton("نعم", on_click=confirm_delete),
+                ft.TextButton("لا", on_click=cancel_delete),
             ],
             actions_alignment=ft.MainAxisAlignment.END,
         )
+        
         self.page.dialog = dialog
         dialog.open = True
         self.page.update()
-
-    # ------------------------------------------------------------
-    # حركة العربات
-    # ------------------------------------------------------------
+    
+    # ================================ حركة العربات ================================
     def show_cart_movement(self):
+        """عرض صفحة حركة العربات"""
         if not self.check_permission('can_move_cart') and not self.check_permission('can_view_movements'):
             self.show_snack_bar("غير مصرح لك بعرض حركة العربات", COLORS['danger'])
             return
-
+        
         self.clear_content()
-
-        # قسم نقل العربة
-        move_container = ft.Container()
+        
+        # عنوان الصفحة
+        self.content_column.controls.append(
+            ft.Text("حركة العربات - نقل بين المستودعات", size=24, weight=ft.FontWeight.BOLD, color=COLORS['dark'])
+        )
+        self.content_column.controls.append(ft.Container(height=20))
+        
+        # ===== قسم نقل العربة =====
         if self.check_permission('can_move_cart'):
-            # قائمة العربات القابلة للنقل
+            # جلب البيانات
             carts = self.db.execute_query("""
                 SELECT c.id, c.serial_number, w.name
                 FROM carts c
@@ -1196,102 +1577,233 @@ class CartsManagementApp:
                 WHERE c.current_warehouse_id IS NOT NULL AND c.status != 'damaged'
                 ORDER BY c.serial_number
             """)
-            cart_options = [f"{c[1]} - ({c[2]})" for c in carts]
-            cart_dict = {f"{c[1]} - ({c[2]})": c[0] for c in carts}
-
+            
             warehouses = self.db.get_all_warehouses()
-            warehouse_options = [w[1] for w in warehouses]
             warehouse_dict = {w[1]: w[0] for w in warehouses}
-
+            warehouse_names = list(warehouse_dict.keys())
+            
+            cart_options = [f"{c[1]} - ({c[2]})" for c in carts]
+            
+            # حقول الإدخال
             cart_dropdown = ft.Dropdown(
                 label="اختر العربة",
-                width=400,
-                options=[ft.dropdown.Option(o) for o in cart_options],
-                on_change=lambda e: self._update_from_warehouse(e, cart_dict, warehouse_dict),
+                width=350,
+                options=[ft.dropdown.Option(opt) for opt in cart_options],
+                on_change=lambda e: self.update_from_warehouse(e, carts)
             )
-            self.cart_dropdown_ref = cart_dropdown
-
-            from_warehouse = ft.Dropdown(
+            
+            from_warehouse_dropdown = ft.Dropdown(
                 label="من مستودع",
-                width=350,
-                options=[ft.dropdown.Option(o) for o in warehouse_options],
-                read_only=True,
+                width=250,
+                options=[ft.dropdown.Option(name) for name in warehouse_names],
             )
-            to_warehouse = ft.Dropdown(
+            
+            to_warehouse_dropdown = ft.Dropdown(
                 label="إلى مستودع",
-                width=350,
-                options=[ft.dropdown.Option(o) for o in warehouse_options],
+                width=250,
+                options=[ft.dropdown.Option(name) for name in warehouse_names],
             )
-            notes_field = ft.TextField(label="ملاحظات", width=400, multiline=True, min_lines=2, max_lines=4)
-
+            
+            notes_field = ft.TextField(
+                label="ملاحظات",
+                width=350,
+                multiline=True,
+                min_lines=2,
+                max_lines=3,
+                text_align=ft.TextAlign.RIGHT
+            )
+            
+            # تخزين المراجع
+            self.cart_dropdown = cart_dropdown
+            self.from_warehouse_dropdown = from_warehouse_dropdown
+            self.to_warehouse_dropdown = to_warehouse_dropdown
+            self.movement_notes = notes_field
+            self.carts_data = carts
+            
             def move_cart(e):
                 cart_text = cart_dropdown.value
-                from_wh = from_warehouse.value
-                to_wh = to_warehouse.value
-                notes = notes_field.value
+                from_warehouse = from_warehouse_dropdown.value
+                to_warehouse = to_warehouse_dropdown.value
+                notes = notes_field.value or ""
+                
                 if not cart_text:
                     self.show_snack_bar("الرجاء اختيار عربة", COLORS['danger'])
                     return
-                if not from_wh:
+                
+                if not from_warehouse:
                     self.show_snack_bar("الرجاء تحديد المستودع المصدر", COLORS['danger'])
                     return
-                if not to_wh:
+                
+                if not to_warehouse:
                     self.show_snack_bar("الرجاء اختيار مستودع الوجهة", COLORS['danger'])
                     return
-                if from_wh == to_wh:
+                
+                if from_warehouse == to_warehouse:
                     self.show_snack_bar("المستودع المصدر والهدف متطابقان", COLORS['danger'])
                     return
-                cart_id = cart_dict.get(cart_text)
-                from_id = warehouse_dict.get(from_wh)
-                to_id = warehouse_dict.get(to_wh)
-                if not cart_id or not from_id or not to_id:
-                    self.show_snack_bar("بيانات غير صحيحة", COLORS['danger'])
+                
+                from_id = warehouse_dict.get(from_warehouse)
+                to_id = warehouse_dict.get(to_warehouse)
+                
+                cart_id = None
+                for c in carts:
+                    if f"{c[1]} - ({c[2]})" == cart_text:
+                        cart_id = c[0]
+                        break
+                
+                if not cart_id:
+                    self.show_snack_bar("العربة غير موجودة", COLORS['danger'])
                     return
-                # التحقق من أن العربة في المستودع المصدر
-                current = self.db.execute_query(
-                    "SELECT current_warehouse_id FROM carts WHERE id = ?", (cart_id,)
+                
+                result = self.db.execute_query(
+                    "SELECT current_warehouse_id FROM carts WHERE id = ?",
+                    (cart_id,)
                 )
-                if not current or current[0][0] != from_id:
+                
+                if not result or result[0][0] != from_id:
                     self.show_snack_bar("العربة ليست في المستودع المصدر المحدد", COLORS['danger'])
                     return
-                # تنفيذ النقل
+                
                 self.db.execute_query(
                     "UPDATE carts SET current_warehouse_id = ?, last_updated = CURRENT_TIMESTAMP WHERE id = ?",
                     (to_id, cart_id)
                 )
+                
                 self.db.execute_insert(
-                    """INSERT INTO movements (cart_id, from_warehouse_id, to_warehouse_id, user_id, notes) 
+                    """INSERT INTO movements 
+                       (cart_id, from_warehouse_id, to_warehouse_id, user_id, notes) 
                        VALUES (?, ?, ?, ?, ?)""",
                     (cart_id, from_id, to_id, self.current_user['id'], notes)
                 )
+                
                 self.db.update_warehouse_count(from_id)
                 self.db.update_warehouse_count(to_id)
+                
                 self.db.log_action(self.current_user['id'], 'move_cart',
-                                   f'نقل العربة {cart_text} من {from_wh} إلى {to_wh}')
+                                  f'نقل العربة {cart_text} من {from_warehouse} إلى {to_warehouse}')
+                
                 self.show_snack_bar("تم نقل العربة بنجاح", COLORS['success'])
-                # إعادة تحميل الصفحة
-                self.show_cart_movement()
-
-            move_container = ft.Container(
-                content=ft.Column([
-                    ft.Text("نقل عربة", size=18, weight=ft.FontWeight.BOLD),
-                    ft.Divider(height=1),
-                    ft.Row([cart_dropdown], alignment=ft.MainAxisAlignment.CENTER),
-                    ft.Row([from_warehouse, to_warehouse], alignment=ft.MainAxisAlignment.CENTER),
-                    ft.Row([notes_field], alignment=ft.MainAxisAlignment.CENTER),
-                    ft.ElevatedButton(
-                        "🔄 نقل العربة",
-                        style=ft.ButtonStyle(bgcolor=COLORS['primary'], color=COLORS['white']),
-                        on_click=move_cart,
-                    ),
-                ], horizontal_alignment=ft.CrossAxisAlignment.CENTER, spacing=15),
-                padding=20,
+                self.show_cart_movement()  # إعادة تحميل الصفحة
+            
+            # بطاقة نقل العربة
+            movement_card = ft.Container(
                 bgcolor=COLORS['white'],
                 border_radius=10,
-                margin=ft.margin.only(bottom=20),
+                border=ft.border.all(1, COLORS['gray']),
+                padding=20,
+                content=ft.Column([
+                    ft.Text("نقل عربة", size=18, weight=ft.FontWeight.BOLD, color=COLORS['dark']),
+                    ft.Divider(height=1, color=COLORS['light']),
+                    
+                    ft.ResponsiveRow([
+                        ft.Container(
+                            col={"sm": 12, "md": 6, "lg": 4},
+                            content=cart_dropdown
+                        ),
+                        ft.Container(
+                            col={"sm": 12, "md": 6, "lg": 4},
+                            content=ft.Row([from_warehouse_dropdown, to_warehouse_dropdown])
+                        ),
+                        ft.Container(
+                            col={"sm": 12, "md": 12, "lg": 4},
+                            content=notes_field
+                        ),
+                    ]),
+                    
+                    ft.Container(height=10),
+                    
+                    ft.ElevatedButton(
+                        text="نقل العربة",
+                        icon=ft.icons.SWAP_HORIZ,
+                        bgcolor=COLORS['primary'],
+                        color=COLORS['white'],
+                        style=ft.ButtonStyle(
+                            shape=ft.RoundedRectangleBorder(radius=8),
+                            padding=ft.padding.symmetric(horizontal=30, vertical=15)
+                        ),
+                        on_click=move_cart
+                    )
+                ])
             )
-
-        # سجل الحركات
+            
+            self.content_column.controls.append(movement_card)
+            self.content_column.controls.append(ft.Container(height=20))
+        
+        # ===== سجل الحركات =====
+        if self.check_permission('can_view_movements'):
+            history_card = ft.Container(
+                bgcolor=COLORS['white'],
+                border_radius=10,
+                border=ft.border.all(1, COLORS['gray']),
+                padding=20,
+                expand=True,
+                content=ft.Column([
+                    ft.Row([
+                        ft.Text("سجل الحركات", size=18, weight=ft.FontWeight.BOLD, color=COLORS['dark']),
+                        ft.TextField(
+                            hint_text="بحث في الحركات...",
+                            width=250,
+                            height=40,
+                            border_radius=8,
+                            text_align=ft.TextAlign.RIGHT,
+                            prefix=ft.Icon(ft.icons.SEARCH),
+                            on_change=self.filter_movements,
+                            ref=ft.Ref[ft.TextField]()
+                        ),
+                    ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
+                    
+                    ft.Divider(height=1, color=COLORS['light']),
+                    
+                    # جدول الحركات
+                    ft.DataTable(
+                        columns=[
+                            ft.DataColumn(ft.Text("التاريخ", size=13, weight=ft.FontWeight.BOLD)),
+                            ft.DataColumn(ft.Text("العربة", size=13, weight=ft.FontWeight.BOLD)),
+                            ft.DataColumn(ft.Text("من", size=13, weight=ft.FontWeight.BOLD)),
+                            ft.DataColumn(ft.Text("إلى", size=13, weight=ft.FontWeight.BOLD)),
+                            ft.DataColumn(ft.Text("المستخدم", size=13, weight=ft.FontWeight.BOLD)),
+                            ft.DataColumn(ft.Text("ملاحظات", size=13, weight=ft.FontWeight.BOLD)),
+                            ft.DataColumn(ft.Text("الإجراءات", size=13, weight=ft.FontWeight.BOLD)),
+                        ],
+                        rows=[],
+                        horizontal_margin=10,
+                        column_spacing=20,
+                        heading_row_color=COLORS['light'],
+                        heading_row_height=40,
+                        data_row_max_height=40,
+                        expand=True,
+                        ref=ft.Ref[ft.DataTable]()
+                    )
+                ], expand=True)
+            )
+            
+            self.movement_table = history_card.content.controls[2]
+            self.movement_search_field = history_card.content.controls[0].controls[1]
+            
+            self.content_column.controls.append(history_card)
+            self.load_movements()
+        
+        self.page.update()
+    
+    def update_from_warehouse(self, e, carts):
+        """تحديث حقل المستودع المصدر بناءً على اختيار العربة"""
+        cart_text = e.control.value
+        if cart_text:
+            for c in carts:
+                if f"{c[1]} - ({c[2]})" == cart_text:
+                    warehouse_name = c[2]
+                    if warehouse_name:
+                        self.from_warehouse_dropdown.value = warehouse_name
+                        self.page.update()
+                    break
+    
+    def load_movements(self):
+        """تحميل سجل الحركات"""
+        if not self.movement_table:
+            return
+        
+        self.movement_table.rows.clear()
+        
         movements = self.db.execute_query("""
             SELECT 
                 m.id,
@@ -1309,319 +1821,366 @@ class CartsManagementApp:
             ORDER BY m.timestamp DESC
             LIMIT 200
         """)
-
-        # حقل بحث في الحركات
-        self.movement_search_field = ft.TextField(
-            hint_text="🔍 بحث في الحركات",
-            width=250,
-            on_change=self.filter_movements,
-        )
-
-        # جدول الحركات
-        self.movement_table = ft.DataTable(
-            columns=[
-                ft.DataColumn(ft.Text("التاريخ")),
-                ft.DataColumn(ft.Text("العربة")),
-                ft.DataColumn(ft.Text("من")),
-                ft.DataColumn(ft.Text("إلى")),
-                ft.DataColumn(ft.Text("المستخدم")),
-                ft.DataColumn(ft.Text("ملاحظات")),
-                ft.DataColumn(ft.Text("الإجراءات")),
-            ],
-            rows=[],
-            border=ft.border.all(1, COLORS['gray']),
-            border_radius=10,
-            vertical_lines=ft.border.BorderSide(1, COLORS['light']),
-            horizontal_lines=ft.border.BorderSide(1, COLORS['light']),
-            column_spacing=15,
-            data_row_max_height=50,
-        )
-
-        self._load_movements(movements)
-
-        self.content_column.controls.extend([
-            ft.Container(
-                content=ft.Column([
-                    ft.Text("حركة العربات - نقل بين المستودعات", size=24, weight=ft.FontWeight.BOLD, color=COLORS['dark']),
-                    move_container if self.check_permission('can_move_cart') else ft.Container(),
-                    ft.Container(
-                        content=ft.Column([
-                            ft.Row([
-                                ft.Text("سجل الحركات", size=18, weight=ft.FontWeight.BOLD),
-                                self.movement_search_field,
-                            ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
-                            ft.Container(
-                                content=self.movement_table,
-                                padding=10,
-                                bgcolor=COLORS['white'],
-                                border_radius=10,
-                                expand=True,
-                            ),
-                        ]),
-                        padding=20,
-                        bgcolor=COLORS['white'],
-                        border_radius=10,
-                        expand=True,
-                    ),
-                ]),
-                padding=ft.padding.only(left=25, right=25, top=20, bottom=20),
-                expand=True,
-            )
-        ])
-        self.page.update()
-
-    def _update_from_warehouse(self, e, cart_dict, warehouse_dict):
-        cart_text = e.control.value
-        if cart_text and cart_text in cart_dict:
-            cart_id = cart_dict[cart_text]
-            result = self.db.execute_query(
-                "SELECT w.name FROM carts c LEFT JOIN warehouses w ON c.current_warehouse_id = w.id WHERE c.id = ?",
-                (cart_id,)
-            )
-            if result and result[0][0]:
-                # تحديث حقل "من مستودع" (يجب الوصول إليه)
-                # في هذه النسخة المبسطة، نتركه للمستخدم لاختياره يدوياً
-                pass
-
-    def _load_movements(self, movements):
-        rows = []
+        
         for m in movements:
             movement_id, timestamp, serial, from_wh, to_wh, username, notes = m
-            actions = ft.Row(spacing=5)
-            if self.check_permission('can_delete_cart'):  # صلاحية حذف الحركات مرتبطة بحذف العربات
-                actions.controls.append(
-                    ft.IconButton(
-                        icon=ft.icons.DELETE,
-                        icon_size=18,
-                        icon_color=COLORS['white'],
-                        bgcolor=COLORS['danger'],
-                        tooltip="حذف الحركة",
-                        on_click=lambda e, mid=movement_id: self._delete_movement_confirm(mid),
-                    )
-                )
-            rows.append(
+            
+            actions_row = ft.Row([
+                ft.IconButton(
+                    icon=ft.icons.DELETE,
+                    icon_size=18,
+                    icon_color=COLORS['danger'],
+                    tooltip="حذف",
+                    on_click=lambda e, mid=movement_id: self.delete_movement(mid),
+                    visible=self.check_permission('can_delete_cart')
+                ),
+            ], spacing=5)
+            
+            self.movement_table.rows.append(
                 ft.DataRow(
                     cells=[
-                        ft.DataCell(ft.Text(timestamp[:16] if timestamp else "")),
-                        ft.DataCell(ft.Text(serial)),
-                        ft.DataCell(ft.Text(from_wh or "-")),
-                        ft.DataCell(ft.Text(to_wh)),
-                        ft.DataCell(ft.Text(username or "")),
-                        ft.DataCell(ft.Text((notes[:20] + '...') if notes and len(notes) > 20 else (notes or ""))),
-                        ft.DataCell(actions),
+                        ft.DataCell(ft.Text(timestamp[:16] if timestamp else "", size=12)),
+                        ft.DataCell(ft.Text(serial, size=12)),
+                        ft.DataCell(ft.Text(from_wh or "-", size=12)),
+                        ft.DataCell(ft.Text(to_wh, size=12)),
+                        ft.DataCell(ft.Text(username or "", size=12)),
+                        ft.DataCell(ft.Text((notes[:20] + '...') if notes and len(notes) > 20 else (notes or ""), size=12)),
+                        ft.DataCell(actions_row),
                     ]
                 )
             )
-        self.movement_table.rows = rows
+        
         self.page.update()
-
+    
     def filter_movements(self, e):
-        search = self.movement_search_field.value.strip()
-        if search:
-            movements = self.db.execute_query("""
-                SELECT 
-                    m.id,
-                    m.timestamp,
-                    c.serial_number,
-                    w1.name as from_name,
-                    w2.name as to_name,
-                    u.username,
-                    m.notes
-                FROM movements m
-                JOIN carts c ON m.cart_id = c.id
-                LEFT JOIN warehouses w1 ON m.from_warehouse_id = w1.id
-                JOIN warehouses w2 ON m.to_warehouse_id = w2.id
-                LEFT JOIN users u ON m.user_id = u.id
-                WHERE c.serial_number LIKE ? OR w1.name LIKE ? OR w2.name LIKE ? OR u.username LIKE ?
-                ORDER BY m.timestamp DESC
-                LIMIT 200
-            """, (f'%{search}%', f'%{search}%', f'%{search}%', f'%{search}%'))
-        else:
-            movements = self.db.execute_query("""
-                SELECT 
-                    m.id,
-                    m.timestamp,
-                    c.serial_number,
-                    w1.name as from_name,
-                    w2.name as to_name,
-                    u.username,
-                    m.notes
-                FROM movements m
-                JOIN carts c ON m.cart_id = c.id
-                LEFT JOIN warehouses w1 ON m.from_warehouse_id = w1.id
-                JOIN warehouses w2 ON m.to_warehouse_id = w2.id
-                LEFT JOIN users u ON m.user_id = u.id
-                ORDER BY m.timestamp DESC
-                LIMIT 200
-            """)
-        self._load_movements(movements)
-
-    def _delete_movement_confirm(self, movement_id):
-        def confirm(e):
+        """فلترة سجل الحركات"""
+        if not self.movement_table:
+            return
+        
+        search_text = e.control.value.strip().lower() if e.control.value else ""
+        
+        # إعادة تحميل البيانات
+        self.load_movements()
+        
+        if search_text:
+            for row in self.movement_table.rows[:]:
+                match = False
+                for i, cell in enumerate(row.cells[:5]):  # الأعمدة الأولى
+                    if isinstance(cell.content, ft.Text):
+                        if search_text in cell.content.value.lower():
+                            match = True
+                            break
+                
+                if not match:
+                    self.movement_table.rows.remove(row)
+        
+        self.page.update()
+    
+    def delete_movement(self, movement_id):
+        """حذف حركة"""
+        def confirm_delete(e):
             self.db.execute_query("DELETE FROM movements WHERE id = ?", (movement_id,))
-            self.db.log_action(self.current_user['id'], 'delete_movement', f'حذف حركة رقم {movement_id}')
-            self.close_dialog()
+            self.db.log_action(self.current_user['id'], 'delete_movement',
+                              f'حذف حركة رقم {movement_id}')
+            
+            dialog.open = False
+            self.page.update()
             self.show_snack_bar("تم حذف الحركة بنجاح", COLORS['success'])
-            self.show_cart_movement()  # إعادة تحميل الصفحة
-
+            self.load_movements()
+        
+        def cancel_delete(e):
+            dialog.open = False
+            self.page.update()
+        
         dialog = ft.AlertDialog(
-            title=ft.Text("تأكيد الحذف", weight=ft.FontWeight.BOLD),
+            title=ft.Text("تأكيد الحذف"),
             content=ft.Text("هل أنت متأكد من حذف هذه الحركة؟"),
             actions=[
-                ft.TextButton("نعم", on_click=confirm),
-                ft.TextButton("لا", on_click=self.close_dialog),
+                ft.TextButton("نعم", on_click=confirm_delete),
+                ft.TextButton("لا", on_click=cancel_delete),
             ],
             actions_alignment=ft.MainAxisAlignment.END,
         )
+        
         self.page.dialog = dialog
         dialog.open = True
         self.page.update()
-
-    # ------------------------------------------------------------
-    # إدارة الصيانة
-    # ------------------------------------------------------------
+    
+    # ================================ إدارة الصيانة ================================
     def show_maintenance(self):
+        """عرض صفحة الصيانة"""
         if not self.check_permission('can_manage_maintenance'):
             self.show_snack_bar("غير مصرح لك بإدارة الصيانة", COLORS['danger'])
             return
-
+        
         self.clear_content()
-
-        # إحصائيات الصيانة
+        
+        # عنوان الصفحة
+        self.content_column.controls.append(
+            ft.Text("إدارة الصيانة", size=24, weight=ft.FontWeight.BOLD, color=COLORS['dark'])
+        )
+        self.content_column.controls.append(ft.Container(height=20))
+        
+        # جلب البيانات
+        carts = self.db.execute_query("""
+            SELECT c.id, c.serial_number, w.name 
+            FROM carts c
+            LEFT JOIN warehouses w ON c.current_warehouse_id = w.id
+            WHERE c.status != 'damaged'
+            ORDER BY c.serial_number
+        """)
+        
+        cart_options = [f"{c[1]} - ({c[2] or 'غير محدد'})" for c in carts]
+        
+        # ===== إحصائيات الصيانة =====
         pending = self.db.execute_query(
             "SELECT COUNT(*) FROM maintenance_records WHERE status = 'pending'"
         )[0][0] or 0
+        
         in_progress = self.db.execute_query(
             "SELECT COUNT(*) FROM maintenance_records WHERE status = 'in_progress'"
         )[0][0] or 0
+        
         completed = self.db.execute_query(
             "SELECT COUNT(*) FROM maintenance_records WHERE status = 'completed'"
         )[0][0] or 0
+        
         total_cost = self.db.execute_query(
             "SELECT SUM(cost) FROM maintenance_records WHERE status = 'completed'"
         )[0][0] or 0
-
+        
         # بطاقات الإحصائيات
-        stats_row = ft.Row([
-            self._build_stat_small_card("📋", "بانتظار الصيانة", str(pending), COLORS['warning']),
-            self._build_stat_small_card("🔧", "قيد التنفيذ", str(in_progress), COLORS['primary']),
-            self._build_stat_small_card("✅", "منجزة", str(completed), COLORS['success']),
-            self._build_stat_small_card("💰", "إجمالي التكاليف", f"{total_cost:.0f} ر.س", COLORS['purple']),
-        ], alignment=ft.MainAxisAlignment.SPACE_EVENLY, spacing=10)
-
-        # قسم إدخال الصيانة
-        input_container = ft.Container()
-        if self.check_permission('can_manage_maintenance'):
-            # قائمة العربات (غير التالفة)
-            carts = self.db.execute_query("""
-                SELECT c.id, c.serial_number, w.name 
-                FROM carts c
-                LEFT JOIN warehouses w ON c.current_warehouse_id = w.id
-                WHERE c.status != 'damaged'
-                ORDER BY c.serial_number
-            """)
-            cart_options = [f"{c[1]} - ({c[2] or 'غير محدد'})" for c in carts]
-            cart_dict = {f"{c[1]} - ({c[2] or 'غير محدد'})": c[0] for c in carts}
-
-            maint_cart = ft.Dropdown(
-                label="العربة",
-                width=400,
-                options=[ft.dropdown.Option(o) for o in cart_options],
-            )
-            maint_type = ft.Dropdown(
-                label="نوع الصيانة",
-                width=350,
-                options=[
-                    ft.dropdown.Option("صيانة دورية"),
-                    ft.dropdown.Option("إصلاح عطل"),
-                    ft.dropdown.Option("تأهيل كامل"),
-                    ft.dropdown.Option("فحص"),
-                ],
-                value="صيانة دورية",
-            )
-            maint_status = ft.Dropdown(
-                label="الحالة",
-                width=350,
-                options=[
-                    ft.dropdown.Option("تحتاج صيانة"),
-                    ft.dropdown.Option("تالفة"),
-                ],
-                value="تحتاج صيانة",
-            )
-            maint_desc = ft.TextField(
-                label="وصف المشكلة",
-                width=400,
-                multiline=True,
-                min_lines=3,
-                max_lines=5,
-            )
-            maint_cost = ft.TextField(
-                label="التكلفة",
-                width=200,
-                value="0",
-                keyboard_type=ft.KeyboardType.NUMBER,
-            )
-
-            def submit_maintenance(e):
-                cart_text = maint_cart.value
-                m_type = maint_type.value
-                status_text = maint_status.value
-                desc = maint_desc.value
-                try:
-                    cost = float(maint_cost.value or 0)
-                except:
-                    cost = 0
-                if not cart_text:
-                    self.show_snack_bar("الرجاء اختيار عربة", COLORS['danger'])
-                    return
-                cart_id = cart_dict.get(cart_text)
-                if not cart_id:
-                    self.show_snack_bar("العربة غير موجودة", COLORS['danger'])
-                    return
-                status_map = {
-                    "تحتاج صيانة": "needs_maintenance",
-                    "تالفة": "damaged"
-                }
-                new_status = status_map.get(status_text, "needs_maintenance")
-                try:
-                    self.db.execute_query(
-                        "UPDATE carts SET status = ?, last_updated = CURRENT_TIMESTAMP WHERE id = ?",
-                        (new_status, cart_id)
-                    )
-                    self.db.execute_insert(
-                        """INSERT INTO maintenance_records 
-                           (cart_id, maintenance_type, status, description, user_id, cost) 
-                           VALUES (?, ?, 'pending', ?, ?, ?)""",
-                        (cart_id, m_type, desc, self.current_user['id'], cost)
-                    )
-                    self.db.log_action(self.current_user['id'], 'add_maintenance',
-                                       f'إدخال العربة {cart_text} للصيانة')
-                    self.show_snack_bar("تم إدخال العربة للصيانة", COLORS['success'])
-                    self.show_maintenance()  # إعادة تحميل
-                except Exception as ex:
-                    self.show_snack_bar(f"حدث خطأ: {str(ex)}", COLORS['danger'])
-
-            input_container = ft.Container(
-                content=ft.Column([
-                    ft.Text("إدخال عربية للصيانة", size=18, weight=ft.FontWeight.BOLD),
-                    ft.Divider(height=1),
-                    ft.Row([maint_cart], alignment=ft.MainAxisAlignment.CENTER),
-                    ft.Row([maint_type, maint_status], alignment=ft.MainAxisAlignment.CENTER),
-                    ft.Row([maint_desc], alignment=ft.MainAxisAlignment.CENTER),
-                    ft.Row([maint_cost], alignment=ft.MainAxisAlignment.CENTER),
-                    ft.ElevatedButton(
-                        "🔧 إدخال للصيانة",
-                        style=ft.ButtonStyle(bgcolor=COLORS['warning'], color=COLORS['white']),
-                        on_click=submit_maintenance,
+        stats_row = ft.ResponsiveRow(
+            spacing=10,
+            controls=[
+                self.create_stat_card("📋", "بانتظار الصيانة", pending, COLORS['warning'], 
+                                     f"{pending} عربة", col={"sm": 6, "md": 3, "lg": 3}),
+                self.create_stat_card("🔧", "قيد التنفيذ", in_progress, COLORS['primary'], 
+                                     f"{in_progress} عربة", col={"sm": 6, "md": 3, "lg": 3}),
+                self.create_stat_card("✅", "منجزة", completed, COLORS['success'], 
+                                     f"{completed} عربة", col={"sm": 6, "md": 3, "lg": 3}),
+                self.create_stat_card("💰", "إجمالي التكاليف", f"{total_cost:.0f} ر.س", COLORS['purple'], 
+                                     "تكاليف الصيانة", col={"sm": 6, "md": 3, "lg": 3}),
+            ]
+        )
+        
+        self.content_column.controls.append(stats_row)
+        self.content_column.controls.append(ft.Container(height=20))
+        
+        # ===== إدخال عربية للصيانة =====
+        input_card = ft.Container(
+            bgcolor=COLORS['white'],
+            border_radius=10,
+            border=ft.border.all(1, COLORS['gray']),
+            padding=20,
+            content=ft.Column([
+                ft.Text("إدخال عربية للصيانة", size=18, weight=ft.FontWeight.BOLD, color=COLORS['dark']),
+                ft.Divider(height=1, color=COLORS['light']),
+                
+                ft.ResponsiveRow([
+                    ft.Container(
+                        col={"sm": 12, "md": 6, "lg": 3},
+                        content=ft.Dropdown(
+                            label="العربة",
+                            options=[ft.dropdown.Option(opt) for opt in cart_options],
+                            ref=ft.Ref[ft.Dropdown]()
+                        )
                     ),
-                ], horizontal_alignment=ft.CrossAxisAlignment.CENTER, spacing=15),
-                padding=20,
-                bgcolor=COLORS['white'],
-                border_radius=10,
-                margin=ft.margin.only(bottom=20),
+                    ft.Container(
+                        col={"sm": 12, "md": 6, "lg": 2},
+                        content=ft.Dropdown(
+                            label="نوع الصيانة",
+                            options=[
+                                ft.dropdown.Option("صيانة دورية"),
+                                ft.dropdown.Option("إصلاح عطل"),
+                                ft.dropdown.Option("تأهيل كامل"),
+                                ft.dropdown.Option("فحص"),
+                            ],
+                            value="صيانة دورية"
+                        )
+                    ),
+                    ft.Container(
+                        col={"sm": 12, "md": 6, "lg": 2},
+                        content=ft.Dropdown(
+                            label="الحالة",
+                            options=[
+                                ft.dropdown.Option("تحتاج صيانة"),
+                                ft.dropdown.Option("تالفة"),
+                            ],
+                            value="تحتاج صيانة"
+                        )
+                    ),
+                    ft.Container(
+                        col={"sm": 12, "md": 6, "lg": 2},
+                        content=ft.TextField(
+                            label="التكلفة",
+                            value="0",
+                            keyboard_type=ft.KeyboardType.NUMBER,
+                            text_align=ft.TextAlign.RIGHT
+                        )
+                    ),
+                ]),
+                
+                ft.ResponsiveRow([
+                    ft.Container(
+                        col={"sm": 12, "md": 12, "lg": 9},
+                        content=ft.TextField(
+                            label="وصف المشكلة",
+                            multiline=True,
+                            min_lines=2,
+                            max_lines=3,
+                            text_align=ft.TextAlign.RIGHT
+                        )
+                    ),
+                    ft.Container(
+                        col={"sm": 12, "md": 12, "lg": 3},
+                        content=ft.ElevatedButton(
+                            text="إدخال للصيانة",
+                            icon=ft.icons.BUILD,
+                            bgcolor=COLORS['warning'],
+                            color=COLORS['white'],
+                            style=ft.ButtonStyle(
+                                shape=ft.RoundedRectangleBorder(radius=8),
+                                padding=ft.padding.symmetric(horizontal=20, vertical=15)
+                            ),
+                            on_click=lambda e: self.submit_maintenance(
+                                e, carts, self.maintenance_inputs
+                            )
+                        )
+                    ),
+                ])
+            ])
+        )
+        
+        # تخزين مراجع حقول الإدخال
+        self.maintenance_inputs = {
+            'cart': input_card.content.controls[2].controls[0].content,
+            'type': input_card.content.controls[2].controls[1].content,
+            'status': input_card.content.controls[2].controls[2].content,
+            'cost': input_card.content.controls[2].controls[3].content,
+            'description': input_card.content.controls[3].controls[0].content
+        }
+        
+        self.content_column.controls.append(input_card)
+        self.content_column.controls.append(ft.Container(height=20))
+        
+        # ===== سجل الصيانة =====
+        records_card = ft.Container(
+            bgcolor=COLORS['white'],
+            border_radius=10,
+            border=ft.border.all(1, COLORS['gray']),
+            padding=20,
+            expand=True,
+            content=ft.Column([
+                ft.Row([
+                    ft.Text("سجل الصيانة", size=18, weight=ft.FontWeight.BOLD, color=COLORS['dark']),
+                    ft.TextField(
+                        hint_text="بحث في الصيانة...",
+                        width=250,
+                        height=40,
+                        border_radius=8,
+                        text_align=ft.TextAlign.RIGHT,
+                        prefix=ft.Icon(ft.icons.SEARCH),
+                        on_change=self.filter_maintenance,
+                        ref=ft.Ref[ft.TextField]()
+                    ),
+                ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
+                
+                ft.Divider(height=1, color=COLORS['light']),
+                
+                # جدول الصيانة
+                ft.DataTable(
+                    columns=[
+                        ft.DataColumn(ft.Text("التاريخ", size=13, weight=ft.FontWeight.BOLD)),
+                        ft.DataColumn(ft.Text("العربة", size=13, weight=ft.FontWeight.BOLD)),
+                        ft.DataColumn(ft.Text("نوع الصيانة", size=13, weight=ft.FontWeight.BOLD)),
+                        ft.DataColumn(ft.Text("الحالة", size=13, weight=ft.FontWeight.BOLD)),
+                        ft.DataColumn(ft.Text("الوصف", size=13, weight=ft.FontWeight.BOLD)),
+                        ft.DataColumn(ft.Text("التكلفة", size=13, weight=ft.FontWeight.BOLD)),
+                        ft.DataColumn(ft.Text("تاريخ الإنجاز", size=13, weight=ft.FontWeight.BOLD)),
+                        ft.DataColumn(ft.Text("الإجراءات", size=13, weight=ft.FontWeight.BOLD)),
+                    ],
+                    rows=[],
+                    horizontal_margin=10,
+                    column_spacing=15,
+                    heading_row_color=COLORS['light'],
+                    heading_row_height=40,
+                    data_row_max_height=50,
+                    expand=True,
+                    ref=ft.Ref[ft.DataTable]()
+                )
+            ], expand=True)
+        )
+        
+        self.maintenance_table = records_card.content.controls[2]
+        self.maintenance_search_field = records_card.content.controls[0].controls[1]
+        
+        self.content_column.controls.append(records_card)
+        self.load_maintenance_records()
+        self.page.update()
+    
+    def submit_maintenance(self, e, carts, inputs):
+        """إدخال عربية للصيانة"""
+        cart_text = inputs['cart'].value
+        maint_type = inputs['type'].value
+        status_text = inputs['status'].value
+        cost_text = inputs['cost'].value
+        description = inputs['description'].value or ""
+        
+        if not cart_text:
+            self.show_snack_bar("الرجاء اختيار عربة", COLORS['danger'])
+            return
+        
+        try:
+            cost = float(cost_text or 0)
+        except ValueError:
+            cost = 0
+        
+        cart_id = None
+        for c in carts:
+            if f"{c[1]} - ({c[2] or 'غير محدد'})" == cart_text:
+                cart_id = c[0]
+                break
+        
+        if not cart_id:
+            self.show_snack_bar("العربة غير موجودة", COLORS['danger'])
+            return
+        
+        status_map = {
+            "تحتاج صيانة": "needs_maintenance",
+            "تالفة": "damaged"
+        }
+        new_status = status_map.get(status_text, "needs_maintenance")
+        
+        try:
+            self.db.execute_query(
+                "UPDATE carts SET status = ?, last_updated = CURRENT_TIMESTAMP WHERE id = ?",
+                (new_status, cart_id)
             )
-
-        # سجل الصيانة
+            
+            self.db.execute_insert(
+                """INSERT INTO maintenance_records 
+                   (cart_id, maintenance_type, status, description, user_id, cost) 
+                   VALUES (?, ?, 'pending', ?, ?, ?)""",
+                (cart_id, maint_type, description, self.current_user['id'], cost)
+            )
+            
+            self.db.log_action(self.current_user['id'], 'add_maintenance',
+                              f'إدخال العربة {cart_text} للصيانة')
+            
+            self.show_snack_bar("تم إدخال العربة للصيانة", COLORS['success'])
+            self.show_maintenance()  # إعادة تحميل الصفحة
+            
+        except Exception as e:
+            self.show_snack_bar(f"حدث خطأ: {str(e)}", COLORS['danger'])
+    
+    def load_maintenance_records(self):
+        """تحميل سجل الصيانة"""
+        if not self.maintenance_table:
+            return
+        
+        self.maintenance_table.rows.clear()
+        
         records = self.db.execute_query("""
             SELECT 
                 m.id,
@@ -1637,319 +2196,211 @@ class CartsManagementApp:
             ORDER BY m.entry_date DESC
             LIMIT 200
         """)
-
-        self.maintenance_search_field = ft.TextField(
-            hint_text="🔍 بحث في الصيانة",
-            width=250,
-            on_change=self.filter_maintenance,
-        )
-
-        self.maintenance_table = ft.DataTable(
-            columns=[
-                ft.DataColumn(ft.Text("التاريخ")),
-                ft.DataColumn(ft.Text("العربة")),
-                ft.DataColumn(ft.Text("نوع الصيانة")),
-                ft.DataColumn(ft.Text("الحالة")),
-                ft.DataColumn(ft.Text("الوصف")),
-                ft.DataColumn(ft.Text("التكلفة")),
-                ft.DataColumn(ft.Text("تاريخ الإنجاز")),
-                ft.DataColumn(ft.Text("الإجراءات")),
-            ],
-            rows=[],
-            border=ft.border.all(1, COLORS['gray']),
-            border_radius=10,
-            vertical_lines=ft.border.BorderSide(1, COLORS['light']),
-            horizontal_lines=ft.border.BorderSide(1, COLORS['light']),
-            column_spacing=15,
-            data_row_max_height=60,
-        )
-
-        self._load_maintenance_records(records)
-
-        self.content_column.controls.extend([
-            ft.Container(
-                content=ft.Column([
-                    ft.Text("إدارة الصيانة", size=24, weight=ft.FontWeight.BOLD, color=COLORS['dark']),
-                    stats_row,
-                    ft.Row([
-                        ft.Container(content=input_container, expand=1),
-                        ft.Container(width=20),
-                        ft.Container(
-                            content=ft.Column([
-                                ft.Text("إحصائيات سريعة", size=16, weight=ft.FontWeight.BOLD),
-                                self._build_stat_simple("📋", "بانتظار الصيانة", str(pending), COLORS['warning']),
-                                self._build_stat_simple("🔧", "قيد التنفيذ", str(in_progress), COLORS['primary']),
-                                self._build_stat_simple("✅", "منجزة", str(completed), COLORS['success']),
-                                self._build_stat_simple("💰", "إجمالي التكاليف", f"{total_cost:.0f} ر.س", COLORS['purple']),
-                            ], spacing=10),
-                            padding=20,
-                            bgcolor=COLORS['white'],
-                            border_radius=10,
-                            expand=0,
-                            width=300,
-                        ),
-                    ]) if input_container.visible else ft.Container(),
-                    ft.Container(
-                        content=ft.Column([
-                            ft.Row([
-                                ft.Text("سجل الصيانة", size=18, weight=ft.FontWeight.BOLD),
-                                self.maintenance_search_field,
-                            ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
-                            ft.Container(
-                                content=self.maintenance_table,
-                                padding=10,
-                                bgcolor=COLORS['white'],
-                                border_radius=10,
-                                expand=True,
-                            ),
-                        ]),
-                        padding=20,
-                        bgcolor=COLORS['white'],
-                        border_radius=10,
-                        expand=True,
-                    ),
-                ]),
-                padding=ft.padding.only(left=25, right=25, top=20, bottom=20),
-                expand=True,
-            )
-        ])
-        self.page.update()
-
-    def _build_stat_small_card(self, icon, title, value, color):
-        return ft.Container(
-            content=ft.Column([
-                ft.Row([
-                    ft.Text(icon, size=24),
-                    ft.Text(title, size=12, color=COLORS['gray']),
-                ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
-                ft.Text(value, size=20, weight=ft.FontWeight.BOLD, color=color),
-            ]),
-            padding=10,
-            bgcolor=COLORS['white'],
-            border_radius=10,
-            expand=True,
-        )
-
-    def _build_stat_simple(self, icon, title, value, color):
-        return ft.Row([
-            ft.Text(icon, size=20),
-            ft.Column([
-                ft.Text(title, size=12, color=COLORS['gray']),
-                ft.Text(value, size=16, weight=ft.FontWeight.BOLD, color=color),
-            ]),
-        ], alignment=ft.MainAxisAlignment.START)
-
-    def _load_maintenance_records(self, records):
-        rows = []
-        for rec in records:
-            rec_id, entry_date, serial, m_type, status, desc, cost, comp_date = rec
+        
+        for record in records:
+            rec_id, entry_date, serial, maint_type, status, desc, cost, comp_date = record
             status_text = MAINTENANCE_STATUS.get(status, status)
-            status_color = {
-                'pending': COLORS['warning'],
-                'in_progress': COLORS['primary'],
-                'completed': COLORS['success']
-            }.get(status, COLORS['gray'])
-
-            actions = ft.Row(spacing=5)
+            
+            # تحديد لون الحالة
+            status_color = COLORS['warning'] if status == 'pending' else \
+                          COLORS['primary'] if status == 'in_progress' else \
+                          COLORS['success']
+            
+            # أزرار الإجراءات
+            actions_row = ft.Row(spacing=5)
+            
             if status == 'pending' and self.check_permission('can_complete_maintenance'):
-                actions.controls.append(
+                actions_row.controls.append(
                     ft.IconButton(
                         icon=ft.icons.CHECK_CIRCLE,
                         icon_size=18,
-                        icon_color=COLORS['white'],
-                        bgcolor=COLORS['success'],
+                        icon_color=COLORS['success'],
                         tooltip="إتمام الصيانة",
-                        on_click=lambda e, rid=rec_id: self._complete_maintenance(rid),
+                        on_click=lambda e, rid=rec_id: self.complete_maintenance(rid)
                     )
                 )
+            
             if self.check_permission('can_edit_cart'):
-                actions.controls.append(
+                actions_row.controls.append(
                     ft.IconButton(
                         icon=ft.icons.EDIT,
                         icon_size=18,
-                        icon_color=COLORS['white'],
-                        bgcolor=COLORS['primary'],
+                        icon_color=COLORS['primary'],
                         tooltip="تعديل",
-                        on_click=lambda e, rid=rec_id: self._edit_maintenance_dialog(rid),
+                        on_click=lambda e, rid=rec_id: self.edit_maintenance_record(rid)
                     )
                 )
+            
             if self.check_permission('can_delete_cart'):
-                actions.controls.append(
+                actions_row.controls.append(
                     ft.IconButton(
                         icon=ft.icons.DELETE,
                         icon_size=18,
-                        icon_color=COLORS['white'],
-                        bgcolor=COLORS['danger'],
+                        icon_color=COLORS['danger'],
                         tooltip="حذف",
-                        on_click=lambda e, rid=rec_id: self._delete_maintenance_confirm(rid),
+                        on_click=lambda e, rid=rec_id: self.delete_maintenance_record(rid)
                     )
                 )
-
-            rows.append(
+            
+            self.maintenance_table.rows.append(
                 ft.DataRow(
                     cells=[
-                        ft.DataCell(ft.Text(entry_date[:16] if entry_date else "")),
-                        ft.DataCell(ft.Text(serial)),
-                        ft.DataCell(ft.Text(m_type or "")),
+                        ft.DataCell(ft.Text(entry_date[:16] if entry_date else "", size=12)),
+                        ft.DataCell(ft.Text(serial, size=12)),
+                        ft.DataCell(ft.Text(maint_type, size=12)),
                         ft.DataCell(ft.Container(
-                            content=ft.Text(status_text),
-                            bgcolor=status_color + '20',
+                            content=ft.Text(status_text, size=12, color=COLORS['white']),
+                            bgcolor=status_color,
                             padding=ft.padding.symmetric(horizontal=8, vertical=2),
-                            border_radius=12,
+                            border_radius=4
                         )),
-                        ft.DataCell(ft.Text((desc[:30] + '...') if desc and len(desc) > 30 else (desc or ""))),
-                        ft.DataCell(ft.Text(f"{cost:.0f} ر.س" if cost else "0 ر.س")),
-                        ft.DataCell(ft.Text(comp_date[:10] if comp_date else "")),
-                        ft.DataCell(actions),
+                        ft.DataCell(ft.Text((desc[:30] + '...') if desc and len(desc) > 30 else (desc or ""), size=12)),
+                        ft.DataCell(ft.Text(f"{cost:.0f} ر.س", size=12)),
+                        ft.DataCell(ft.Text(comp_date[:10] if comp_date else "", size=12)),
+                        ft.DataCell(actions_row),
                     ]
                 )
             )
-        self.maintenance_table.rows = rows
+        
         self.page.update()
-
-    def filter_maintenance(self, e):
-        search = self.maintenance_search_field.value.strip()
-        if search:
-            records = self.db.execute_query("""
-                SELECT 
-                    m.id,
-                    m.entry_date,
-                    c.serial_number,
-                    m.maintenance_type,
-                    m.status,
-                    m.description,
-                    m.cost,
-                    m.completion_date
-                FROM maintenance_records m
-                JOIN carts c ON m.cart_id = c.id
-                WHERE c.serial_number LIKE ? OR m.maintenance_type LIKE ? OR m.description LIKE ?
-                ORDER BY m.entry_date DESC
-                LIMIT 200
-            """, (f'%{search}%', f'%{search}%', f'%{search}%'))
-        else:
-            records = self.db.execute_query("""
-                SELECT 
-                    m.id,
-                    m.entry_date,
-                    c.serial_number,
-                    m.maintenance_type,
-                    m.status,
-                    m.description,
-                    m.cost,
-                    m.completion_date
-                FROM maintenance_records m
-                JOIN carts c ON m.cart_id = c.id
-                ORDER BY m.entry_date DESC
-                LIMIT 200
-            """)
-        self._load_maintenance_records(records)
-
-    def _complete_maintenance(self, record_id):
-        def confirm(e):
+    
+    def complete_maintenance(self, record_id):
+        """إتمام الصيانة"""
+        if not self.check_permission('can_complete_maintenance'):
+            self.show_snack_bar("غير مصرح لك بإتمام الصيانة", COLORS['danger'])
+            return
+        
+        def confirm_complete(e):
             self.db.execute_query(
                 """UPDATE maintenance_records 
                    SET status = 'completed', completion_date = CURRENT_TIMESTAMP, completed_by = ? 
                    WHERE id = ?""",
                 (self.current_user['id'], record_id)
             )
-            # تحديث حالة العربة إلى سليمة
+            
             result = self.db.execute_query(
-                "SELECT cart_id FROM maintenance_records WHERE id = ?", (record_id,)
+                "SELECT cart_id FROM maintenance_records WHERE id = ?",
+                (record_id,)
             )
+            
             if result:
                 cart_id = result[0][0]
                 self.db.execute_query(
                     "UPDATE carts SET status = 'sound', last_updated = CURRENT_TIMESTAMP WHERE id = ?",
                     (cart_id,)
                 )
+            
             self.db.log_action(self.current_user['id'], 'complete_maintenance',
-                               f'إتمام صيانة للسجل رقم {record_id}')
-            self.close_dialog()
+                              f'إتمام صيانة للسجل رقم {record_id}')
+            
+            dialog.open = False
+            self.page.update()
             self.show_snack_bar("تم إتمام الصيانة", COLORS['success'])
-            self.show_maintenance()
-
+            self.load_maintenance_records()
+        
+        def cancel_complete(e):
+            dialog.open = False
+            self.page.update()
+        
         dialog = ft.AlertDialog(
-            title=ft.Text("تأكيد الإتمام", weight=ft.FontWeight.BOLD),
+            title=ft.Text("تأكيد إتمام الصيانة"),
             content=ft.Text("هل أنت متأكد من إتمام هذه الصيانة؟"),
             actions=[
-                ft.TextButton("نعم", on_click=confirm),
-                ft.TextButton("لا", on_click=self.close_dialog),
+                ft.TextButton("نعم", on_click=confirm_complete),
+                ft.TextButton("لا", on_click=cancel_complete),
             ],
             actions_alignment=ft.MainAxisAlignment.END,
         )
+        
         self.page.dialog = dialog
         dialog.open = True
         self.page.update()
-
-    def _edit_maintenance_dialog(self, record_id):
-        # جلب بيانات السجل
+    
+    def edit_maintenance_record(self, record_id):
+        """تعديل سجل الصيانة"""
+        if not self.check_permission('can_edit_cart'):
+            self.show_snack_bar("غير مصرح لك بتعديل سجلات الصيانة", COLORS['danger'])
+            return
+        
         result = self.db.execute_query("""
             SELECT m.cart_id, c.serial_number, m.maintenance_type, m.description, m.cost, m.status
             FROM maintenance_records m
             JOIN carts c ON m.cart_id = c.id
             WHERE m.id = ?
         """, (record_id,))
+        
         if not result:
             self.show_snack_bar("سجل الصيانة غير موجود", COLORS['danger'])
             return
-        cart_id, serial, m_type, desc, cost, status = result[0]
-
-        maint_type = ft.Dropdown(
+        
+        cart_id, serial, maint_type, description, cost, status = result[0]
+        
+        # حقول الإدخال
+        type_dropdown = ft.Dropdown(
             label="نوع الصيانة",
-            width=350,
+            width=300,
             options=[
                 ft.dropdown.Option("صيانة دورية"),
                 ft.dropdown.Option("إصلاح عطل"),
                 ft.dropdown.Option("تأهيل كامل"),
                 ft.dropdown.Option("فحص"),
             ],
-            value=m_type,
+            value=maint_type
         )
-        maint_status = ft.Dropdown(
+        
+        status_dropdown = ft.Dropdown(
             label="الحالة",
-            width=350,
+            width=300,
             options=[
                 ft.dropdown.Option("بانتظار الصيانة"),
                 ft.dropdown.Option("قيد التنفيذ"),
                 ft.dropdown.Option("منجزة"),
             ],
-            value=MAINTENANCE_STATUS.get(status, status),
+            value=MAINTENANCE_STATUS.get(status, status)
         )
-        maint_desc = ft.TextField(
+        
+        desc_field = ft.TextField(
             label="وصف المشكلة",
-            width=400,
+            width=300,
+            value=description or "",
             multiline=True,
             min_lines=3,
             max_lines=5,
-            value=desc or "",
+            text_align=ft.TextAlign.RIGHT
         )
-        maint_cost = ft.TextField(
+        
+        cost_field = ft.TextField(
             label="التكلفة",
-            width=200,
+            width=300,
             value=str(cost or 0),
             keyboard_type=ft.KeyboardType.NUMBER,
+            text_align=ft.TextAlign.RIGHT
         )
-
-        def save(e):
-            new_type = maint_type.value
-            new_status_text = maint_status.value
-            new_desc = maint_desc.value
+        
+        def save_edit(e):
+            new_maint_type = type_dropdown.value
+            new_status_text = status_dropdown.value
+            new_description = desc_field.value or ""
+            
             try:
-                new_cost = float(maint_cost.value or 0)
-            except:
+                new_cost = float(cost_field.value or 0)
+            except ValueError:
                 new_cost = 0
+            
             status_map = {
                 "بانتظار الصيانة": "pending",
                 "قيد التنفيذ": "in_progress",
                 "منجزة": "completed"
             }
             new_status = status_map.get(new_status_text, "pending")
+            
             self.db.execute_query(
                 """UPDATE maintenance_records 
                    SET maintenance_type = ?, status = ?, description = ?, cost = ? 
                    WHERE id = ?""",
-                (new_type, new_status, new_desc, new_cost, record_id)
+                (new_maint_type, new_status, new_description, new_cost, record_id)
             )
+            
             if new_status == 'completed' and status != 'completed':
                 self.db.execute_query(
                     "UPDATE carts SET status = 'sound', last_updated = CURRENT_TIMESTAMP WHERE id = ?",
@@ -1959,475 +2410,687 @@ class CartsManagementApp:
                     "UPDATE maintenance_records SET completion_date = CURRENT_TIMESTAMP WHERE id = ?",
                     (record_id,)
                 )
+            
             self.db.log_action(self.current_user['id'], 'edit_maintenance',
-                               f'تعديل سجل صيانة رقم {record_id}')
-            self.close_dialog()
-            self.show_snack_bar("تم تحديث سجل الصيانة", COLORS['success'])
-            self.show_maintenance()
-
+                              f'تعديل سجل صيانة رقم {record_id}')
+            
+            dialog.open = False
+            self.page.update()
+            self.show_snack_bar("تم تحديث سجل الصيانة بنجاح", COLORS['success'])
+            self.load_maintenance_records()
+        
         dialog = ft.AlertDialog(
-            title=ft.Text(f"تعديل سجل الصيانة - {serial}", weight=ft.FontWeight.BOLD),
+            title=ft.Text(f"تعديل سجل الصيانة - {serial}", size=18, weight=ft.FontWeight.BOLD),
             content=ft.Container(
+                width=350,
                 content=ft.Column([
-                    ft.Text(f"العربة: {serial}", size=14, color=COLORS['gray']),
-                    maint_type,
-                    maint_status,
-                    maint_desc,
-                    maint_cost,
-                ], width=450, spacing=15, scroll=ft.ScrollMode.AUTO),
-                padding=10,
+                    type_dropdown,
+                    status_dropdown,
+                    desc_field,
+                    cost_field,
+                ], spacing=15, scroll=ft.ScrollMode.AUTO),
+                padding=10
             ),
             actions=[
-                ft.TextButton("حفظ", on_click=save),
-                ft.TextButton("إلغاء", on_click=self.close_dialog),
+                ft.TextButton("إلغاء", on_click=lambda e: self.close_dialog(dialog)),
+                ft.ElevatedButton("حفظ", on_click=save_edit, bgcolor=COLORS['success'], color=COLORS['white']),
             ],
             actions_alignment=ft.MainAxisAlignment.END,
         )
+        
         self.page.dialog = dialog
         dialog.open = True
         self.page.update()
-
-    def _delete_maintenance_confirm(self, record_id):
-        def confirm(e):
+    
+    def delete_maintenance_record(self, record_id):
+        """حذف سجل صيانة"""
+        def confirm_delete(e):
             self.db.execute_query("DELETE FROM maintenance_records WHERE id = ?", (record_id,))
             self.db.log_action(self.current_user['id'], 'delete_maintenance',
-                               f'حذف سجل صيانة رقم {record_id}')
-            self.close_dialog()
-            self.show_snack_bar("تم حذف سجل الصيانة", COLORS['success'])
-            self.show_maintenance()
-
+                              f'حذف سجل صيانة رقم {record_id}')
+            
+            dialog.open = False
+            self.page.update()
+            self.show_snack_bar("تم حذف سجل الصيانة بنجاح", COLORS['success'])
+            self.load_maintenance_records()
+        
+        def cancel_delete(e):
+            dialog.open = False
+            self.page.update()
+        
         dialog = ft.AlertDialog(
-            title=ft.Text("تأكيد الحذف", weight=ft.FontWeight.BOLD),
+            title=ft.Text("تأكيد الحذف"),
             content=ft.Text("هل أنت متأكد من حذف سجل الصيانة هذا؟"),
             actions=[
-                ft.TextButton("نعم", on_click=confirm),
-                ft.TextButton("لا", on_click=self.close_dialog),
+                ft.TextButton("نعم", on_click=confirm_delete),
+                ft.TextButton("لا", on_click=cancel_delete),
             ],
             actions_alignment=ft.MainAxisAlignment.END,
         )
+        
         self.page.dialog = dialog
         dialog.open = True
         self.page.update()
-
-    # ------------------------------------------------------------
-    # إدارة المستودعات
-    # ------------------------------------------------------------
+    
+    def filter_maintenance(self, e):
+        """فلترة سجل الصيانة"""
+        if not self.maintenance_table:
+            return
+        
+        search_text = e.control.value.strip().lower() if e.control.value else ""
+        
+        # إعادة تحميل البيانات
+        self.load_maintenance_records()
+        
+        if search_text:
+            for row in self.maintenance_table.rows[:]:
+                match = False
+                for i, cell in enumerate(row.cells[:5]):  # الأعمدة الأولى
+                    if isinstance(cell.content, ft.Text):
+                        if search_text in cell.content.value.lower():
+                            match = True
+                            break
+                    elif isinstance(cell.content, ft.Container):
+                        if isinstance(cell.content.content, ft.Text):
+                            if search_text in cell.content.content.value.lower():
+                                match = True
+                                break
+                
+                if not match:
+                    self.maintenance_table.rows.remove(row)
+        
+        self.page.update()
+    
+    # ================================ إدارة المستودعات ================================
     def show_warehouse_management(self):
+        """عرض صفحة إدارة المستودعات"""
         if not self.check_permission('can_view_warehouses'):
             self.show_snack_bar("غير مصرح لك بعرض المستودعات", COLORS['danger'])
             return
-
+        
         self.clear_content()
-
-        header = ft.Row([
+        
+        # عنوان الصفحة
+        title_row = ft.Row([
             ft.Text("إدارة المستودعات", size=24, weight=ft.FontWeight.BOLD, color=COLORS['dark']),
-            ft.ElevatedButton(
-                "➕ إضافة مستودع",
-                icon=ft.icons.ADD,
-                style=ft.ButtonStyle(bgcolor=COLORS['success'], color=COLORS['white']),
-                visible=self.check_permission('can_add_warehouse'),
-                on_click=lambda e: self._add_warehouse_dialog(),
-            ),
+            ft.Row([
+                ft.TextField(
+                    hint_text="بحث...",
+                    width=250,
+                    height=40,
+                    border_radius=8,
+                    text_align=ft.TextAlign.RIGHT,
+                    prefix=ft.Icon(ft.icons.SEARCH),
+                    on_change=self.filter_warehouses,
+                    ref=ft.Ref[ft.TextField]()
+                ),
+                ft.ElevatedButton(
+                    text="إضافة مستودع",
+                    icon=ft.icons.ADD_BUSINESS,
+                    bgcolor=COLORS['success'],
+                    color=COLORS['white'],
+                    style=ft.ButtonStyle(
+                        shape=ft.RoundedRectangleBorder(radius=8),
+                    ),
+                    on_click=self.show_add_warehouse_dialog,
+                    visible=self.check_permission('can_add_warehouse')
+                ),
+            ])
         ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN)
-
-        # حقل بحث
-        self.warehouse_search_field = ft.TextField(
-            hint_text="🔍 بحث في المستودعات",
-            width=250,
-            on_change=self.filter_warehouses,
-        )
-
+        
+        self.content_column.controls.append(title_row)
+        self.content_column.controls.append(ft.Container(height=20))
+        
+        # تخزين مرجع حقل البحث
+        self.warehouse_search_field = title_row.controls[1].controls[0]
+        
         # جدول المستودعات
         self.warehouse_table = ft.DataTable(
             columns=[
-                ft.DataColumn(ft.Text("المعرف")),
-                ft.DataColumn(ft.Text("اسم المستودع")),
-                ft.DataColumn(ft.Text("السعة")),
-                ft.DataColumn(ft.Text("العدد الحالي")),
-                ft.DataColumn(ft.Text("نسبة الإشغال")),
-                ft.DataColumn(ft.Text("الإجراءات")),
+                ft.DataColumn(ft.Text("المعرف", size=14, weight=ft.FontWeight.BOLD)),
+                ft.DataColumn(ft.Text("اسم المستودع", size=14, weight=ft.FontWeight.BOLD)),
+                ft.DataColumn(ft.Text("السعة", size=14, weight=ft.FontWeight.BOLD)),
+                ft.DataColumn(ft.Text("العدد الحالي", size=14, weight=ft.FontWeight.BOLD)),
+                ft.DataColumn(ft.Text("نسبة الإشغال", size=14, weight=ft.FontWeight.BOLD)),
+                ft.DataColumn(ft.Text("الإجراءات", size=14, weight=ft.FontWeight.BOLD)),
             ],
             rows=[],
-            border=ft.border.all(1, COLORS['gray']),
-            border_radius=10,
-            vertical_lines=ft.border.BorderSide(1, COLORS['light']),
-            horizontal_lines=ft.border.BorderSide(1, COLORS['light']),
-            column_spacing=20,
+            horizontal_margin=10,
+            column_spacing=30,
+            heading_row_color=COLORS['light'],
+            heading_row_height=50,
             data_row_max_height=50,
+            expand=True
         )
-
-        self.content_column.controls.extend([
-            ft.Container(
-                content=ft.Column([
-                    header,
-                    ft.Row([self.warehouse_search_field], alignment=ft.MainAxisAlignment.END),
-                    ft.Container(
-                        content=self.warehouse_table,
-                        padding=10,
-                        bgcolor=COLORS['white'],
-                        border_radius=10,
-                        expand=True,
-                    ),
-                ]),
-                padding=ft.padding.only(left=25, right=25, top=20, bottom=20),
-                expand=True,
-            )
-        ])
-
-        self._load_warehouses()
-
-    def _load_warehouses(self, search=""):
-        if search:
-            warehouses = self.db.execute_query("""
-                SELECT id, name, capacity, current_count 
-                FROM warehouses 
-                WHERE is_active = 1 AND name LIKE ?
-                ORDER BY id
-            """, (f'%{search}%',))
-        else:
-            warehouses = self.db.execute_query("""
-                SELECT id, name, capacity, current_count 
-                FROM warehouses 
-                WHERE is_active = 1
-                ORDER BY id
-            """)
-
-        base_names = [wh['name'] for wh in WAREHOUSES]
-        rows = []
+        
+        # حاوية الجدول مع التمرير
+        table_container = ft.Container(
+            content=ft.Column([
+                self.warehouse_table
+            ], scroll=ft.ScrollMode.AUTO),
+            expand=True,
+            bgcolor=COLORS['white'],
+            border_radius=10,
+            border=ft.border.all(1, COLORS['gray']),
+            padding=15
+        )
+        
+        self.content_column.controls.append(table_container)
+        self.load_warehouses()
+        self.page.update()
+    
+    def load_warehouses(self):
+        """تحميل قائمة المستودعات"""
+        if not self.warehouse_table:
+            return
+        
+        self.warehouse_table.rows.clear()
+        
+        warehouses = self.db.execute_query("""
+            SELECT id, name, capacity, current_count 
+            FROM warehouses 
+            WHERE is_active = 1
+            ORDER BY id
+        """)
+        
+        base_warehouse_names = [wh['name'] for wh in WAREHOUSES]
+        
         for w in warehouses:
             wid, name, capacity, current = w
             percentage = (current / capacity * 100) if capacity > 0 else 0
-            color = COLORS['danger'] if percentage >= 90 else COLORS['warning'] if percentage >= 70 else COLORS['success']
-
-            actions = ft.Row(spacing=5)
+            
+            # تحديد لون نسبة الإشغال
+            if percentage >= 90:
+                color = COLORS['danger']
+            elif percentage >= 70:
+                color = COLORS['warning']
+            else:
+                color = COLORS['success']
+            
+            # أزرار الإجراءات
+            actions_row = ft.Row(spacing=5)
+            
             if self.check_permission('can_edit_warehouse'):
-                actions.controls.append(
+                actions_row.controls.append(
                     ft.IconButton(
                         icon=ft.icons.EDIT,
                         icon_size=18,
-                        icon_color=COLORS['white'],
-                        bgcolor=COLORS['primary'],
+                        icon_color=COLORS['primary'],
                         tooltip="تعديل",
-                        on_click=lambda e, wid=wid, n=name: self._edit_warehouse_dialog(wid, n),
+                        on_click=lambda e, wid=wid, n=name: self.edit_warehouse(wid, n)
                     )
                 )
-            if self.check_permission('can_delete_warehouse') and name not in base_names:
-                actions.controls.append(
+            
+            if self.check_permission('can_delete_warehouse') and name not in base_warehouse_names:
+                actions_row.controls.append(
                     ft.IconButton(
                         icon=ft.icons.DELETE,
                         icon_size=18,
-                        icon_color=COLORS['white'],
-                        bgcolor=COLORS['danger'],
+                        icon_color=COLORS['danger'],
                         tooltip="حذف",
-                        on_click=lambda e, wid=wid, n=name: self._delete_warehouse_confirm(wid, n),
+                        on_click=lambda e, wid=wid, n=name: self.delete_warehouse(wid, n)
                     )
                 )
-
-            rows.append(
+            
+            self.warehouse_table.rows.append(
                 ft.DataRow(
                     cells=[
-                        ft.DataCell(ft.Text(str(wid))),
-                        ft.DataCell(ft.Text(name)),
-                        ft.DataCell(ft.Text(str(capacity))),
-                        ft.DataCell(ft.Text(str(current))),
+                        ft.DataCell(ft.Text(str(wid), size=13)),
+                        ft.DataCell(ft.Text(name, size=13)),
+                        ft.DataCell(ft.Text(str(capacity), size=13)),
+                        ft.DataCell(ft.Text(str(current), size=13)),
                         ft.DataCell(ft.Container(
-                            content=ft.Text(f"{percentage:.1f}%"),
-                            bgcolor=color + '20',
-                            padding=ft.padding.symmetric(horizontal=8, vertical=2),
-                            border_radius=12,
+                            content=ft.Row([
+                                ft.ProgressBar(
+                                    width=80,
+                                    value=percentage/100,
+                                    bgcolor=COLORS['light'],
+                                    color=color,
+                                ),
+                                ft.Text(f"{percentage:.1f}%", size=12, color=color),
+                            ]),
                         )),
-                        ft.DataCell(actions),
+                        ft.DataCell(actions_row),
                     ]
                 )
             )
-        self.warehouse_table.rows = rows
+        
         self.page.update()
-
+    
     def filter_warehouses(self, e):
-        self._load_warehouses(self.warehouse_search_field.value.strip())
-
-    def _add_warehouse_dialog(self):
-        name_field = ft.TextField(label="اسم المستودع", width=350, autofocus=True)
-        capacity_field = ft.TextField(label="السعة", width=350, value="100", keyboard_type=ft.KeyboardType.NUMBER)
-        desc_field = ft.TextField(label="الوصف", width=350)
+        """فلترة المستودعات حسب البحث"""
+        if not self.warehouse_table:
+            return
+        
+        search_text = e.control.value.strip().lower() if e.control.value else ""
+        
+        for row in self.warehouse_table.rows[:]:
+            name_cell = row.cells[1].content
+            if isinstance(name_cell, ft.Text):
+                if search_text and search_text not in name_cell.value.lower():
+                    self.warehouse_table.rows.remove(row)
+        
+        self.page.update()
+    
+    def show_add_warehouse_dialog(self, e):
+        """عرض نافذة إضافة مستودع جديد"""
+        if not self.check_permission('can_add_warehouse'):
+            self.show_snack_bar("غير مصرح لك بإضافة مستودعات", COLORS['danger'])
+            return
+        
+        # حقول الإدخال
+        name_field = ft.TextField(
+            label="اسم المستودع",
+            width=300,
+            border_radius=8,
+            text_align=ft.TextAlign.RIGHT,
+            autofocus=True
+        )
+        
+        capacity_field = ft.TextField(
+            label="السعة",
+            width=300,
+            value="100",
+            keyboard_type=ft.KeyboardType.NUMBER,
+            text_align=ft.TextAlign.RIGHT
+        )
+        
+        desc_field = ft.TextField(
+            label="الوصف",
+            width=300,
+            text_align=ft.TextAlign.RIGHT
+        )
+        
         type_dropdown = ft.Dropdown(
             label="نوع المستودع",
-            width=350,
+            width=300,
             options=[
-                ft.dropdown.Option("main"),
-                ft.dropdown.Option("external"),
-                ft.dropdown.Option("north"),
-                ft.dropdown.Option("south"),
-                ft.dropdown.Option("other"),
+                ft.dropdown.Option("main", "رئيسي"),
+                ft.dropdown.Option("external", "خارجي"),
+                ft.dropdown.Option("north", "شمالي"),
+                ft.dropdown.Option("south", "جنوبي"),
+                ft.dropdown.Option("other", "آخر"),
             ],
-            value="other",
+            value="other"
         )
-
-        def save(e):
-            name = name_field.value.strip()
-            capacity_text = capacity_field.value.strip()
-            desc = desc_field.value.strip()
-            loc_type = type_dropdown.value
+        
+        def save_warehouse(e):
+            name = name_field.value.strip() if name_field.value else ""
+            capacity_text = capacity_field.value.strip() if capacity_field.value else ""
+            description = desc_field.value or ""
+            location_type = type_dropdown.value
+            
             if not name:
                 self.show_snack_bar("الرجاء إدخال اسم المستودع", COLORS['danger'])
                 return
+            
             try:
                 capacity = int(capacity_text) if capacity_text else 100
-            except:
+            except ValueError:
                 capacity = 100
+            
             try:
                 self.db.execute_insert(
                     """INSERT INTO warehouses 
                        (name, capacity, current_count, description, location_type, is_active, created_by) 
                        VALUES (?, ?, 0, ?, ?, 1, ?)""",
-                    (name, capacity, desc, loc_type, self.current_user['id'])
+                    (name, capacity, description, location_type, self.current_user['id'])
                 )
-                self.db.log_action(self.current_user['id'], 'add_warehouse', f'إضافة مستودع جديد {name}')
-                self.close_dialog()
+                
+                self.db.log_action(self.current_user['id'], 'add_warehouse',
+                                  f'إضافة مستودع جديد {name}')
+                
+                dialog.open = False
+                self.page.update()
                 self.show_snack_bar("تم إضافة المستودع بنجاح", COLORS['success'])
-                self._load_warehouses()
+                self.load_warehouses()
+                
             except sqlite3.IntegrityError:
                 self.show_snack_bar("اسم المستودع موجود مسبقاً", COLORS['danger'])
-
+        
         dialog = ft.AlertDialog(
-            title=ft.Text("إضافة مستودع جديد", weight=ft.FontWeight.BOLD),
+            title=ft.Text("إضافة مستودع جديد", size=18, weight=ft.FontWeight.BOLD),
             content=ft.Container(
-                content=ft.Column([name_field, capacity_field, desc_field, type_dropdown],
-                                  width=400, spacing=15, scroll=ft.ScrollMode.AUTO),
-                padding=10,
+                width=350,
+                content=ft.Column([
+                    name_field,
+                    capacity_field,
+                    desc_field,
+                    type_dropdown,
+                ], spacing=15),
+                padding=10
             ),
             actions=[
-                ft.TextButton("حفظ", on_click=save),
-                ft.TextButton("إلغاء", on_click=self.close_dialog),
+                ft.TextButton("إلغاء", on_click=lambda e: self.close_dialog(dialog)),
+                ft.ElevatedButton("حفظ", on_click=save_warehouse, bgcolor=COLORS['success'], color=COLORS['white']),
             ],
             actions_alignment=ft.MainAxisAlignment.END,
         )
+        
         self.page.dialog = dialog
         dialog.open = True
         self.page.update()
-
-    def _edit_warehouse_dialog(self, warehouse_id, name):
+    
+    def edit_warehouse(self, warehouse_id, name):
+        """تعديل بيانات المستودع"""
+        if not self.check_permission('can_edit_warehouse'):
+            self.show_snack_bar("غير مصرح لك بتعديل المستودعات", COLORS['danger'])
+            return
+        
         result = self.db.execute_query(
             "SELECT capacity, description, location_type FROM warehouses WHERE id = ?",
             (warehouse_id,)
         )
+        
         if not result:
             self.show_snack_bar("المستودع غير موجود", COLORS['danger'])
             return
-        capacity, desc, loc_type = result[0]
-
-        name_display = ft.TextField(label="اسم المستودع", width=350, value=name, read_only=True)
-        capacity_field = ft.TextField(label="السعة", width=350, value=str(capacity), keyboard_type=ft.KeyboardType.NUMBER)
-        desc_field = ft.TextField(label="الوصف", width=350, value=desc or "")
+        
+        capacity, description, location_type = result[0]
+        
+        # حقول الإدخال
+        name_display = ft.TextField(
+            label="اسم المستودع",
+            width=300,
+            value=name,
+            read_only=True,
+            border_radius=8,
+            text_align=ft.TextAlign.RIGHT
+        )
+        
+        capacity_field = ft.TextField(
+            label="السعة",
+            width=300,
+            value=str(capacity),
+            keyboard_type=ft.KeyboardType.NUMBER,
+            text_align=ft.TextAlign.RIGHT
+        )
+        
+        desc_field = ft.TextField(
+            label="الوصف",
+            width=300,
+            value=description or "",
+            text_align=ft.TextAlign.RIGHT
+        )
+        
         type_dropdown = ft.Dropdown(
             label="نوع المستودع",
-            width=350,
+            width=300,
             options=[
-                ft.dropdown.Option("main"),
-                ft.dropdown.Option("external"),
-                ft.dropdown.Option("north"),
-                ft.dropdown.Option("south"),
-                ft.dropdown.Option("other"),
+                ft.dropdown.Option("main", "رئيسي"),
+                ft.dropdown.Option("external", "خارجي"),
+                ft.dropdown.Option("north", "شمالي"),
+                ft.dropdown.Option("south", "جنوبي"),
+                ft.dropdown.Option("other", "آخر"),
             ],
-            value=loc_type or "other",
+            value=location_type or "other"
         )
-
-        def save(e):
+        
+        def save_edit(e):
             new_capacity_text = capacity_field.value.strip()
-            new_desc = desc_field.value.strip()
-            new_loc_type = type_dropdown.value
+            new_description = desc_field.value or ""
+            new_location_type = type_dropdown.value
+            
             try:
                 new_capacity = int(new_capacity_text) if new_capacity_text else capacity
-            except:
+            except ValueError:
                 new_capacity = capacity
+            
             self.db.execute_query(
                 "UPDATE warehouses SET capacity = ?, description = ?, location_type = ? WHERE id = ?",
-                (new_capacity, new_desc, new_loc_type, warehouse_id)
+                (new_capacity, new_description, new_location_type, warehouse_id)
             )
-            self.db.log_action(self.current_user['id'], 'edit_warehouse', f'تعديل المستودع {name}')
-            self.close_dialog()
+            
+            self.db.log_action(self.current_user['id'], 'edit_warehouse',
+                              f'تعديل المستودع {name}')
+            
+            dialog.open = False
+            self.page.update()
             self.show_snack_bar("تم تحديث بيانات المستودع بنجاح", COLORS['success'])
-            self._load_warehouses()
-
+            self.load_warehouses()
+        
         dialog = ft.AlertDialog(
-            title=ft.Text(f"تعديل المستودع: {name}", weight=ft.FontWeight.BOLD),
+            title=ft.Text(f"تعديل المستودع: {name}", size=18, weight=ft.FontWeight.BOLD),
             content=ft.Container(
-                content=ft.Column([name_display, capacity_field, desc_field, type_dropdown],
-                                  width=400, spacing=15, scroll=ft.ScrollMode.AUTO),
-                padding=10,
+                width=350,
+                content=ft.Column([
+                    name_display,
+                    capacity_field,
+                    desc_field,
+                    type_dropdown,
+                ], spacing=15),
+                padding=10
             ),
             actions=[
-                ft.TextButton("حفظ", on_click=save),
-                ft.TextButton("إلغاء", on_click=self.close_dialog),
+                ft.TextButton("إلغاء", on_click=lambda e: self.close_dialog(dialog)),
+                ft.ElevatedButton("حفظ", on_click=save_edit, bgcolor=COLORS['success'], color=COLORS['white']),
             ],
             actions_alignment=ft.MainAxisAlignment.END,
         )
+        
         self.page.dialog = dialog
         dialog.open = True
         self.page.update()
-
-    def _delete_warehouse_confirm(self, warehouse_id, name):
-        # التحقق من وجود عربات في المستودع
-        count = self.db.execute_query(
+    
+    def delete_warehouse(self, warehouse_id, name):
+        """حذف مستودع"""
+        if not self.check_permission('can_delete_warehouse'):
+            self.show_snack_bar("غير مصرح لك بحذف المستودعات", COLORS['danger'])
+            return
+        
+        result = self.db.execute_query(
             "SELECT COUNT(*) FROM carts WHERE current_warehouse_id = ?",
             (warehouse_id,)
-        )[0][0] or 0
+        )
+        count = result[0][0] if result else 0
+        
         if count > 0:
             self.show_snack_bar(f"لا يمكن حذف المستودع لأنه يحتوي على {count} عربة. قم بنقلها أولاً.", COLORS['danger'])
             return
-
-        def confirm(e):
+        
+        def confirm_delete(e):
             self.db.execute_query(
                 "UPDATE warehouses SET is_active = 0 WHERE id = ?",
                 (warehouse_id,)
             )
-            self.db.log_action(self.current_user['id'], 'delete_warehouse', f'حذف المستودع {name}')
-            self.close_dialog()
+            
+            self.db.log_action(self.current_user['id'], 'delete_warehouse',
+                              f'حذف المستودع {name}')
+            
+            dialog.open = False
+            self.page.update()
             self.show_snack_bar("تم حذف المستودع بنجاح", COLORS['success'])
-            self._load_warehouses()
-
+            self.load_warehouses()
+        
+        def cancel_delete(e):
+            dialog.open = False
+            self.page.update()
+        
         dialog = ft.AlertDialog(
-            title=ft.Text("تأكيد الحذف", weight=ft.FontWeight.BOLD),
+            title=ft.Text("تأكيد الحذف"),
             content=ft.Text(f"هل أنت متأكد من حذف المستودع '{name}'؟"),
             actions=[
-                ft.TextButton("نعم", on_click=confirm),
-                ft.TextButton("لا", on_click=self.close_dialog),
+                ft.TextButton("نعم", on_click=confirm_delete),
+                ft.TextButton("لا", on_click=cancel_delete),
             ],
             actions_alignment=ft.MainAxisAlignment.END,
         )
+        
         self.page.dialog = dialog
         dialog.open = True
         self.page.update()
-
-    # ------------------------------------------------------------
-    # التقارير
-    # ------------------------------------------------------------
+    
+    # ================================ التقارير ================================
     def show_reports(self):
+        """عرض صفحة التقارير"""
         if not self.check_permission('can_view_reports'):
             self.show_snack_bar("غير مصرح لك بعرض التقارير", COLORS['danger'])
             return
-
+        
         self.clear_content()
-
-        # خيارات التقرير
-        self.report_type = ft.Dropdown(
-            label="نوع التقرير",
-            width=300,
-            options=[
-                ft.dropdown.Option("تقرير حالة العربات"),
-                ft.dropdown.Option("تقرير حركة العربات"),
-                ft.dropdown.Option("تقرير الصيانة"),
-                ft.dropdown.Option("تقرير المستودعات"),
-                ft.dropdown.Option("تقرير شامل"),
-            ],
-            value="تقرير حالة العربات",
-            on_change=lambda e: self._update_report_preview(),
+        
+        # عنوان الصفحة
+        self.content_column.controls.append(
+            ft.Text("التقارير والتحليلات", size=24, weight=ft.FontWeight.BOLD, color=COLORS['dark'])
         )
-        self.period = ft.Dropdown(
-            label="الفترة",
-            width=300,
-            options=[
-                ft.dropdown.Option("اليوم"),
-                ft.dropdown.Option("آخر 7 أيام"),
-                ft.dropdown.Option("آخر 30 يوم"),
-                ft.dropdown.Option("آخر سنة"),
-                ft.dropdown.Option("كل الفترات"),
-            ],
-            value="كل الفترات",
-            on_change=lambda e: self._update_report_preview(),
-        )
-
-        # جدول المعاينة
-        self.preview_table = ft.DataTable(
-            columns=[],
-            rows=[],
-            border=ft.border.all(1, COLORS['gray']),
+        self.content_column.controls.append(ft.Container(height=20))
+        
+        # ===== خيارات التقرير =====
+        options_card = ft.Container(
+            bgcolor=COLORS['white'],
             border_radius=10,
-            vertical_lines=ft.border.BorderSide(1, COLORS['light']),
-            horizontal_lines=ft.border.BorderSide(1, COLORS['light']),
-            column_spacing=20,
-            data_row_max_height=40,
-        )
-
-        self.content_column.controls.extend([
-            ft.Container(
-                content=ft.Column([
-                    ft.Text("التقارير والتحليلات", size=24, weight=ft.FontWeight.BOLD, color=COLORS['dark']),
+            border=ft.border.all(1, COLORS['gray']),
+            padding=20,
+            content=ft.Column([
+                ft.Text("خيارات التقرير", size=18, weight=ft.FontWeight.BOLD, color=COLORS['dark']),
+                ft.Divider(height=1, color=COLORS['light']),
+                
+                ft.ResponsiveRow([
                     ft.Container(
-                        content=ft.Column([
-                            ft.Text("خيارات التقرير", size=18, weight=ft.FontWeight.BOLD),
-                            ft.Row([self.report_type, self.period], alignment=ft.MainAxisAlignment.START),
-                            ft.Row([
-                                ft.ElevatedButton(
-                                    "👁️ معاينة التقرير",
-                                    style=ft.ButtonStyle(bgcolor=COLORS['primary'], color=COLORS['white']),
-                                    on_click=lambda e: self._update_report_preview(),
-                                ),
-                                ft.ElevatedButton(
-                                    "📊 تصدير Excel",
-                                    style=ft.ButtonStyle(bgcolor=COLORS['success'], color=COLORS['white']),
-                                    visible=self.check_permission('can_export_reports') and EXCEL_AVAILABLE,
-                                    on_click=self._export_excel,
-                                ),
-                                ft.ElevatedButton(
-                                    "📄 تصدير PDF",
-                                    style=ft.ButtonStyle(bgcolor=COLORS['danger'], color=COLORS['white']),
-                                    visible=self.check_permission('can_export_reports') and PDF_AVAILABLE,
-                                    on_click=self._export_pdf,
-                                ),
-                            ], alignment=ft.MainAxisAlignment.START),
-                        ]),
-                        padding=20,
-                        bgcolor=COLORS['white'],
-                        border_radius=10,
-                        margin=ft.margin.only(bottom=20),
+                        col={"sm": 12, "md": 6, "lg": 4},
+                        content=ft.Dropdown(
+                            label="نوع التقرير",
+                            options=[
+                                ft.dropdown.Option("تقرير حالة العربات"),
+                                ft.dropdown.Option("تقرير حركة العربات"),
+                                ft.dropdown.Option("تقرير الصيانة"),
+                                ft.dropdown.Option("تقرير المستودعات"),
+                                ft.dropdown.Option("تقرير شامل"),
+                            ],
+                            value="تقرير حالة العربات",
+                            on_change=self.update_report_preview,
+                            ref=ft.Ref[ft.Dropdown]()
+                        )
                     ),
                     ft.Container(
-                        content=ft.Column([
-                            ft.Text("معاينة التقرير", size=18, weight=ft.FontWeight.BOLD),
-                            ft.Container(
-                                content=self.preview_table,
-                                padding=10,
-                                bgcolor=COLORS['white'],
-                                border_radius=10,
-                                expand=True,
-                                scroll=ft.ScrollMode.AUTO,
+                        col={"sm": 12, "md": 6, "lg": 4},
+                        content=ft.Dropdown(
+                            label="الفترة",
+                            options=[
+                                ft.dropdown.Option("اليوم"),
+                                ft.dropdown.Option("آخر 7 أيام"),
+                                ft.dropdown.Option("آخر 30 يوم"),
+                                ft.dropdown.Option("آخر سنة"),
+                                ft.dropdown.Option("كل الفترات"),
+                            ],
+                            value="كل الفترات",
+                            on_change=self.update_report_preview,
+                            ref=ft.Ref[ft.Dropdown]()
+                        )
+                    ),
+                    ft.Container(
+                        col={"sm": 12, "md": 12, "lg": 4},
+                        content=ft.Row([
+                            ft.ElevatedButton(
+                                text="معاينة التقرير",
+                                icon=ft.icons.PREVIEW,
+                                bgcolor=COLORS['primary'],
+                                color=COLORS['white'],
+                                style=ft.ButtonStyle(
+                                    shape=ft.RoundedRectangleBorder(radius=8),
+                                ),
+                                on_click=self.update_report_preview
                             ),
-                        ]),
-                        padding=20,
-                        bgcolor=COLORS['white'],
-                        border_radius=10,
-                        expand=True,
+                            ft.ElevatedButton(
+                                text="تصدير Excel",
+                                icon=ft.icons.TABLE_CHART,
+                                bgcolor=COLORS['success'],
+                                color=COLORS['white'],
+                                style=ft.ButtonStyle(
+                                    shape=ft.RoundedRectangleBorder(radius=8),
+                                ),
+                                on_click=self.export_to_excel,
+                                visible=self.check_permission('can_export_reports') and EXCEL_AVAILABLE
+                            ),
+                            ft.ElevatedButton(
+                                text="تصدير PDF",
+                                icon=ft.icons.PICTURE_AS_PDF,
+                                bgcolor=COLORS['danger'],
+                                color=COLORS['white'],
+                                style=ft.ButtonStyle(
+                                    shape=ft.RoundedRectangleBorder(radius=8),
+                                ),
+                                on_click=self.export_to_pdf,
+                                visible=self.check_permission('can_export_reports') and FPDF_AVAILABLE
+                            ),
+                        ], alignment=ft.MainAxisAlignment.END)
                     ),
-                ]),
-                padding=ft.padding.only(left=25, right=25, top=20, bottom=20),
-                expand=True,
-            )
-        ])
-
-        self._update_report_preview()
-
-    def _update_report_preview(self):
-        report_type = self.report_type.value
-        period = self.period.value
-
-        if report_type == "تقرير حالة العربات":
-            self._preview_cart_status()
-        elif report_type == "تقرير حركة العربات":
-            self._preview_movement(period)
-        elif report_type == "تقرير الصيانة":
-            self._preview_maintenance(period)
-        elif report_type == "تقرير المستودعات":
-            self._preview_warehouse()
-        elif report_type == "تقرير شامل":
-            self._preview_summary()
-
-    def _preview_cart_status(self):
-        columns = [
-            ft.DataColumn(ft.Text("الحالة")),
-            ft.DataColumn(ft.Text("العدد")),
-            ft.DataColumn(ft.Text("النسبة المئوية")),
+                ])
+            ])
+        )
+        
+        self.report_type_dropdown = options_card.content.controls[2].controls[0].content
+        self.period_dropdown = options_card.content.controls[2].controls[1].content
+        
+        self.content_column.controls.append(options_card)
+        self.content_column.controls.append(ft.Container(height=20))
+        
+        # ===== معاينة التقرير =====
+        preview_card = ft.Container(
+            bgcolor=COLORS['white'],
+            border_radius=10,
+            border=ft.border.all(1, COLORS['gray']),
+            padding=20,
+            expand=True,
+            content=ft.Column([
+                ft.Text("معاينة التقرير", size=18, weight=ft.FontWeight.BOLD, color=COLORS['dark']),
+                ft.Divider(height=1, color=COLORS['light']),
+                
+                ft.Container(
+                    content=ft.DataTable(
+                        columns=[],
+                        rows=[],
+                        horizontal_margin=10,
+                        column_spacing=20,
+                        heading_row_color=COLORS['light'],
+                        heading_row_height=40,
+                        data_row_max_height=40,
+                        expand=True,
+                        ref=ft.Ref[ft.DataTable]()
+                    ),
+                    expand=True,
+                    scroll=ft.ScrollMode.AUTO
+                )
+            ], expand=True)
+        )
+        
+        self.preview_table = preview_card.content.controls[2].content
+        self.content_column.controls.append(preview_card)
+        
+        self.update_report_preview(None)
+        self.page.update()
+    
+    def update_report_preview(self, e):
+        """تحديث معاينة التقرير"""
+        if not self.preview_table:
+            return
+        
+        report_type = self.report_type_dropdown.value if self.report_type_dropdown else "تقرير حالة العربات"
+        period = self.period_dropdown.value if self.period_dropdown else "كل الفترات"
+        
+        try:
+            if report_type == "تقرير حالة العربات":
+                self.preview_cart_status_report()
+            elif report_type == "تقرير حركة العربات":
+                self.preview_movement_report(period)
+            elif report_type == "تقرير الصيانة":
+                self.preview_maintenance_report(period)
+            elif report_type == "تقرير المستودعات":
+                self.preview_warehouse_report()
+            elif report_type == "تقرير شامل":
+                self.preview_summary_report()
+        except Exception as ex:
+            self.show_snack_bar(f"حدث خطأ أثناء إنشاء المعاينة: {str(ex)}", COLORS['danger'])
+    
+    def preview_cart_status_report(self):
+        """معاينة تقرير حالة العربات"""
+        self.preview_table.columns = [
+            ft.DataColumn(ft.Text("الحالة", size=14, weight=ft.FontWeight.BOLD)),
+            ft.DataColumn(ft.Text("العدد", size=14, weight=ft.FontWeight.BOLD)),
+            ft.DataColumn(ft.Text("النسبة المئوية", size=14, weight=ft.FontWeight.BOLD)),
         ]
+        self.preview_table.rows.clear()
+        
         data = self.db.execute_query("""
             SELECT 
                 status,
@@ -2438,27 +3101,32 @@ class CartsManagementApp:
             UNION
             SELECT 'الإجمالي', COUNT(*), 100.0 FROM carts
         """)
-        rows = []
+        
         for row in data:
             status, count, percentage = row
             status_text = CART_STATUS.get(status, status) if status != 'الإجمالي' else status
-            rows.append(
-                ft.DataRow(cells=[
-                    ft.DataCell(ft.Text(status_text)),
-                    ft.DataCell(ft.Text(str(count))),
-                    ft.DataCell(ft.Text(f"{percentage}%")),
-                ])
+            
+            self.preview_table.rows.append(
+                ft.DataRow(
+                    cells=[
+                        ft.DataCell(ft.Text(status_text, size=13)),
+                        ft.DataCell(ft.Text(str(count), size=13)),
+                        ft.DataCell(ft.Text(f"{percentage}%", size=13)),
+                    ]
+                )
             )
-        self.preview_table.columns = columns
-        self.preview_table.rows = rows
+        
         self.page.update()
-
-    def _preview_movement(self, period):
-        columns = [
-            ft.DataColumn(ft.Text("التاريخ")),
-            ft.DataColumn(ft.Text("عدد الحركات")),
-            ft.DataColumn(ft.Text("عربات مختلفة")),
+    
+    def preview_movement_report(self, period):
+        """معاينة تقرير حركة العربات"""
+        self.preview_table.columns = [
+            ft.DataColumn(ft.Text("التاريخ", size=14, weight=ft.FontWeight.BOLD)),
+            ft.DataColumn(ft.Text("عدد الحركات", size=14, weight=ft.FontWeight.BOLD)),
+            ft.DataColumn(ft.Text("عربات مختلفة", size=14, weight=ft.FontWeight.BOLD)),
         ]
+        self.preview_table.rows.clear()
+        
         limit = ""
         if period == "اليوم":
             limit = "AND DATE(timestamp) = DATE('now')"
@@ -2468,6 +3136,7 @@ class CartsManagementApp:
             limit = "AND DATE(timestamp) >= DATE('now', '-30 days')"
         elif period == "آخر سنة":
             limit = "AND DATE(timestamp) >= DATE('now', '-1 year')"
+        
         query = f"""
             SELECT 
                 DATE(timestamp) as date,
@@ -2479,20 +3148,31 @@ class CartsManagementApp:
             ORDER BY date DESC
             LIMIT 10
         """
+        
         data = self.db.execute_query(query)
-        rows = []
+        
         for row in data:
-            rows.append(ft.DataRow(cells=[ft.DataCell(ft.Text(str(cell))) for cell in row]))
-        self.preview_table.columns = columns
-        self.preview_table.rows = rows
+            self.preview_table.rows.append(
+                ft.DataRow(
+                    cells=[
+                        ft.DataCell(ft.Text(row[0] or "", size=13)),
+                        ft.DataCell(ft.Text(str(row[1]), size=13)),
+                        ft.DataCell(ft.Text(str(row[2]), size=13)),
+                    ]
+                )
+            )
+        
         self.page.update()
-
-    def _preview_maintenance(self, period):
-        columns = [
-            ft.DataColumn(ft.Text("حالة الصيانة")),
-            ft.DataColumn(ft.Text("العدد")),
-            ft.DataColumn(ft.Text("التكلفة الإجمالية")),
+    
+    def preview_maintenance_report(self, period):
+        """معاينة تقرير الصيانة"""
+        self.preview_table.columns = [
+            ft.DataColumn(ft.Text("حالة الصيانة", size=14, weight=ft.FontWeight.BOLD)),
+            ft.DataColumn(ft.Text("العدد", size=14, weight=ft.FontWeight.BOLD)),
+            ft.DataColumn(ft.Text("التكلفة الإجمالية", size=14, weight=ft.FontWeight.BOLD)),
         ]
+        self.preview_table.rows.clear()
+        
         limit = ""
         if period == "اليوم":
             limit = "AND DATE(entry_date) = DATE('now')"
@@ -2502,6 +3182,7 @@ class CartsManagementApp:
             limit = "AND DATE(entry_date) >= DATE('now', '-30 days')"
         elif period == "آخر سنة":
             limit = "AND DATE(entry_date) >= DATE('now', '-1 year')"
+        
         query = f"""
             SELECT 
                 status,
@@ -2511,29 +3192,35 @@ class CartsManagementApp:
             WHERE 1=1 {limit}
             GROUP BY status
         """
+        
         data = self.db.execute_query(query)
-        rows = []
+        
         for row in data:
             status, count, total_cost = row
             status_text = MAINTENANCE_STATUS.get(status, status)
-            rows.append(
-                ft.DataRow(cells=[
-                    ft.DataCell(ft.Text(status_text)),
-                    ft.DataCell(ft.Text(str(count))),
-                    ft.DataCell(ft.Text(f"{total_cost or 0:.0f} ر.س")),
-                ])
+            
+            self.preview_table.rows.append(
+                ft.DataRow(
+                    cells=[
+                        ft.DataCell(ft.Text(status_text, size=13)),
+                        ft.DataCell(ft.Text(str(count), size=13)),
+                        ft.DataCell(ft.Text(f"{total_cost or 0:.0f} ر.س", size=13)),
+                    ]
+                )
             )
-        self.preview_table.columns = columns
-        self.preview_table.rows = rows
+        
         self.page.update()
-
-    def _preview_warehouse(self):
-        columns = [
-            ft.DataColumn(ft.Text("المستودع")),
-            ft.DataColumn(ft.Text("السعة")),
-            ft.DataColumn(ft.Text("العدد الحالي")),
-            ft.DataColumn(ft.Text("نسبة الإشغال")),
+    
+    def preview_warehouse_report(self):
+        """معاينة تقرير المستودعات"""
+        self.preview_table.columns = [
+            ft.DataColumn(ft.Text("المستودع", size=14, weight=ft.FontWeight.BOLD)),
+            ft.DataColumn(ft.Text("السعة", size=14, weight=ft.FontWeight.BOLD)),
+            ft.DataColumn(ft.Text("العدد الحالي", size=14, weight=ft.FontWeight.BOLD)),
+            ft.DataColumn(ft.Text("نسبة الإشغال", size=14, weight=ft.FontWeight.BOLD)),
         ]
+        self.preview_table.rows.clear()
+        
         data = self.db.execute_query("""
             SELECT 
                 name,
@@ -2544,23 +3231,31 @@ class CartsManagementApp:
             WHERE is_active = 1
             ORDER BY occupancy DESC
         """)
-        rows = []
+        
         for row in data:
-            rows.append(ft.DataRow(cells=[
-                ft.DataCell(ft.Text(row[0])),
-                ft.DataCell(ft.Text(str(row[1]))),
-                ft.DataCell(ft.Text(str(row[2]))),
-                ft.DataCell(ft.Text(f"{row[3]}%")),
-            ]))
-        self.preview_table.columns = columns
-        self.preview_table.rows = rows
+            name, capacity, current, occupancy = row
+            
+            self.preview_table.rows.append(
+                ft.DataRow(
+                    cells=[
+                        ft.DataCell(ft.Text(name, size=13)),
+                        ft.DataCell(ft.Text(str(capacity), size=13)),
+                        ft.DataCell(ft.Text(str(current), size=13)),
+                        ft.DataCell(ft.Text(f"{occupancy}%", size=13)),
+                    ]
+                )
+            )
+        
         self.page.update()
-
-    def _preview_summary(self):
-        columns = [
-            ft.DataColumn(ft.Text("المؤشر")),
-            ft.DataColumn(ft.Text("القيمة")),
+    
+    def preview_summary_report(self):
+        """معاينة التقرير الشامل"""
+        self.preview_table.columns = [
+            ft.DataColumn(ft.Text("المؤشر", size=14, weight=ft.FontWeight.BOLD)),
+            ft.DataColumn(ft.Text("القيمة", size=14, weight=ft.FontWeight.BOLD)),
         ]
+        self.preview_table.rows.clear()
+        
         total_carts = self.db.execute_query("SELECT COUNT(*) FROM carts")[0][0] or 0
         sound_carts = self.db.execute_query("SELECT COUNT(*) FROM carts WHERE status = 'sound'")[0][0] or 0
         maintenance_carts = self.db.execute_query("SELECT COUNT(*) FROM carts WHERE status = 'needs_maintenance'")[0][0] or 0
@@ -2570,7 +3265,7 @@ class CartsManagementApp:
         total_maintenance = self.db.execute_query("SELECT COUNT(*) FROM maintenance_records")[0][0] or 0
         total_cost = self.db.execute_query("SELECT SUM(cost) FROM maintenance_records WHERE status = 'completed'")[0][0] or 0
         total_users = self.db.execute_query("SELECT COUNT(*) FROM users WHERE is_active = 1")[0][0] or 0
-
+        
         summary_data = [
             ("إجمالي العربات", f"{total_carts} عربة"),
             ("عربات سليمة", f"{sound_carts} عربة ({sound_carts/total_carts*100:.1f}%)" if total_carts > 0 else "0"),
@@ -2583,399 +3278,576 @@ class CartsManagementApp:
             ("المستخدمين النشطين", f"{total_users} مستخدم"),
             ("اسم المستخدم", self.current_user['username']),
             ("الدور", "مدير" if self.current_user['role'] == 'admin' else "مشغل"),
-            ("تاريخ التقرير", datetime.now().strftime('%Y-%m-%d %H:%M')),
+            ("تاريخ التقرير", datetime.now().strftime('%Y-%m-%d %H:%M'))
         ]
-        rows = []
+        
         for indicator, value in summary_data:
-            rows.append(ft.DataRow(cells=[
-                ft.DataCell(ft.Text(indicator)),
-                ft.DataCell(ft.Text(value)),
-            ]))
-        self.preview_table.columns = columns
-        self.preview_table.rows = rows
+            self.preview_table.rows.append(
+                ft.DataRow(
+                    cells=[
+                        ft.DataCell(ft.Text(indicator, size=13)),
+                        ft.DataCell(ft.Text(value, size=13)),
+                    ]
+                )
+            )
+        
         self.page.update()
-
-    def _export_excel(self, e):
+    
+    def export_to_excel(self, e):
+        """تصدير التقرير إلى Excel"""
         if not self.check_permission('can_export_reports'):
             self.show_snack_bar("غير مصرح لك بتصدير التقارير", COLORS['danger'])
             return
+        
         if not EXCEL_AVAILABLE:
             self.show_snack_bar("مكتبة openpyxl غير مثبتة", COLORS['danger'])
             return
+        
         try:
-            from openpyxl import Workbook
-            # طلب حفظ الملف
-            def save_file(result: list):
-                if result and result.path:
-                    filename = result.path
-                    wb = Workbook()
-                    ws = wb.active
-                    ws.title = "تقرير"
-                    ws['A1'] = f"تقرير: {self.report_type.value}"
-                    ws['A2'] = f"تاريخ التقرير: {datetime.now().strftime('%Y-%m-%d %H:%M')}"
-                    ws['A3'] = f"المستخدم: {self.current_user['username']}"
-                    # رؤوس الأعمدة
-                    headers = [col.label.value for col in self.preview_table.columns]
-                    for c, h in enumerate(headers, 1):
-                        ws.cell(row=5, column=c, value=h)
-                    # البيانات
-                    for r, row in enumerate(self.preview_table.rows, 6):
-                        for c, cell in enumerate(row.cells, 1):
-                            ws.cell(row=r, column=c, value=cell.content.value)
-                    wb.save(filename)
-                    self.show_snack_bar(f"تم حفظ التقرير: {os.path.basename(filename)}", COLORS['success'])
-                    self.db.log_action(self.current_user['id'], 'export_excel',
-                                       f'تصدير تقرير {self.report_type.value} إلى Excel')
-            self.page.dialog = ft.FilePicker(on_result=save_file)
-            self.page.overlay.append(self.page.dialog)
-            self.page.update()
-            self.page.dialog.save_file(
-                file_name=f"تقرير_{self.report_type.value}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+            from tkinter import filedialog, Tk
+            
+            root = Tk()
+            root.withdraw()
+            
+            filename = filedialog.asksaveasfilename(
+                defaultextension=".xlsx",
+                filetypes=[("Excel files", "*.xlsx"), ("All files", "*.*")],
+                initialfile=f"تقرير_{self.report_type_dropdown.value}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
             )
+            
+            root.destroy()
+            
+            if filename:
+                wb = Workbook()
+                ws = wb.active
+                ws.title = "تقرير"
+                
+                ws['A1'] = f"تقرير: {self.report_type_dropdown.value}"
+                ws['A2'] = f"تاريخ التقرير: {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+                ws['A3'] = f"المستخدم: {self.current_user['username']}"
+                
+                # إضافة الرؤوس
+                headers = [col.label.value for col in self.preview_table.columns]
+                for col_num, header in enumerate(headers, 1):
+                    ws.cell(row=5, column=col_num, value=header)
+                
+                # إضافة البيانات
+                row_num = 6
+                for row in self.preview_table.rows:
+                    for col_num, cell in enumerate(row.cells, 1):
+                        if isinstance(cell.content, ft.Text):
+                            ws.cell(row=row_num, column=col_num, value=cell.content.value)
+                        elif isinstance(cell.content, ft.Container):
+                            if isinstance(cell.content.content, ft.Text):
+                                ws.cell(row=row_num, column=col_num, value=cell.content.content.value)
+                    row_num += 1
+                
+                wb.save(filename)
+                
+                self.db.log_action(self.current_user['id'], 'export_excel',
+                                  f'تصدير تقرير {self.report_type_dropdown.value} إلى Excel')
+                
+                self.show_snack_bar(f"تم حفظ التقرير بنجاح", COLORS['success'])
+                
         except Exception as ex:
-            self.show_snack_bar(f"خطأ: {str(ex)}", COLORS['danger'])
-
-    def _export_pdf(self, e):
+            self.show_snack_bar(f"حدث خطأ أثناء حفظ الملف: {str(ex)}", COLORS['danger'])
+    
+    def export_to_pdf(self, e):
+        """تصدير التقرير إلى PDF"""
         if not self.check_permission('can_export_reports'):
             self.show_snack_bar("غير مصرح لك بتصدير التقارير", COLORS['danger'])
             return
-        if not PDF_AVAILABLE:
+        
+        if not FPDF_AVAILABLE:
             self.show_snack_bar("مكتبة fpdf غير مثبتة", COLORS['danger'])
             return
+        
         try:
-            from fpdf import FPDF
-            def save_file(result: list):
-                if result and result.path:
-                    filename = result.path
-                    pdf = FPDF()
-                    pdf.add_page()
-                    pdf.set_font('Arial', '', 16)
-                    pdf.cell(200, 10, txt=f"تقرير: {self.report_type.value}", ln=1, align='C')
-                    pdf.set_font('Arial', '', 12)
-                    pdf.cell(200, 10, txt=f"تاريخ التقرير: {datetime.now().strftime('%Y-%m-%d %H:%M')}", ln=1, align='C')
-                    pdf.cell(200, 10, txt=f"المستخدم: {self.current_user['username']}", ln=1, align='C')
-                    pdf.ln(10)
-                    col_width = pdf.w / (len(self.preview_table.columns) + 1)
-                    for col in self.preview_table.columns:
-                        pdf.cell(col_width, 10, col.label.value, border=1)
-                    pdf.ln()
-                    for row in self.preview_table.rows:
-                        for cell in row.cells:
-                            pdf.cell(col_width, 10, str(cell.content.value), border=1)
-                        pdf.ln()
-                    pdf.output(filename)
-                    self.show_snack_bar(f"تم حفظ التقرير: {os.path.basename(filename)}", COLORS['success'])
-                    self.db.log_action(self.current_user['id'], 'export_pdf',
-                                       f'تصدير تقرير {self.report_type.value} إلى PDF')
-            self.page.dialog = ft.FilePicker(on_result=save_file)
-            self.page.overlay.append(self.page.dialog)
-            self.page.update()
-            self.page.dialog.save_file(
-                file_name=f"تقرير_{self.report_type.value}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
+            from tkinter import filedialog, Tk
+            
+            root = Tk()
+            root.withdraw()
+            
+            filename = filedialog.asksaveasfilename(
+                defaultextension=".pdf",
+                filetypes=[("PDF files", "*.pdf"), ("All files", "*.*")],
+                initialfile=f"تقرير_{self.report_type_dropdown.value}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
             )
+            
+            root.destroy()
+            
+            if filename:
+                pdf = FPDF()
+                pdf.add_page()
+                
+                # محاولة استخدام خط عربي
+                try:
+                    font_path = self.find_arabic_font()
+                    if font_path:
+                        pdf.add_font("Arabic", "", font_path, uni=True)
+                        pdf.set_font("Arabic", "", 16)
+                    else:
+                        pdf.set_font("Arial", "", 16)
+                except:
+                    pdf.set_font("Arial", "", 16)
+                
+                # عنوان التقرير
+                pdf.cell(200, 10, txt=self.report_type_dropdown.value, ln=1, align='C')
+                
+                pdf.set_font_size(12)
+                pdf.cell(200, 10, txt=f"تاريخ التقرير: {datetime.now().strftime('%Y-%m-%d %H:%M')}", ln=1, align='C')
+                pdf.cell(200, 10, txt=f"المستخدم: {self.current_user['username']}", ln=1, align='C')
+                pdf.ln(10)
+                
+                # جدول البيانات
+                col_width = pdf.w / (len(self.preview_table.columns) + 1)
+                pdf.set_font_size(10)
+                
+                # رؤوس الأعمدة
+                for col in self.preview_table.columns:
+                    pdf.cell(col_width, 10, col.label.value, border=1, align='C')
+                pdf.ln()
+                
+                # بيانات الجدول
+                for row in self.preview_table.rows:
+                    for cell in row.cells:
+                        if isinstance(cell.content, ft.Text):
+                            pdf.cell(col_width, 10, cell.content.value, border=1, align='C')
+                        elif isinstance(cell.content, ft.Container):
+                            if isinstance(cell.content.content, ft.Text):
+                                pdf.cell(col_width, 10, cell.content.content.value, border=1, align='C')
+                    pdf.ln()
+                
+                pdf.output(filename)
+                
+                self.db.log_action(self.current_user['id'], 'export_pdf',
+                                  f'تصدير تقرير {self.report_type_dropdown.value} إلى PDF')
+                
+                self.show_snack_bar(f"تم حفظ التقرير بنجاح", COLORS['success'])
+                
         except Exception as ex:
-            self.show_snack_bar(f"خطأ: {str(ex)}", COLORS['danger'])
-
-    # ------------------------------------------------------------
-    # إدارة المستخدمين (للمدير فقط)
-    # ------------------------------------------------------------
+            self.show_snack_bar(f"حدث خطأ أثناء إنشاء ملف PDF: {str(ex)}", COLORS['danger'])
+    
+    def find_arabic_font(self):
+        """البحث عن خط عربي في النظام"""
+        possible_paths = [
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "DejaVuSans.ttf"),
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+            "C:\\Windows\\Fonts\\arial.ttf",
+            "C:\\Windows\\Fonts\\tahoma.ttf",
+            "/System/Library/Fonts/Supplemental/Arial.ttf",
+        ]
+        for path in possible_paths:
+            if os.path.exists(path):
+                return path
+        return None
+    
+    # ================================ إدارة المستخدمين ================================
     def show_user_management(self):
+        """عرض صفحة إدارة المستخدمين"""
         if self.current_user['role'] != 'admin':
             self.show_snack_bar("غير مصرح لك بالوصول إلى هذه الصفحة", COLORS['danger'])
             return
-
+        
         self.clear_content()
-
-        header = ft.Row([
+        
+        # عنوان الصفحة
+        title_row = ft.Row([
             ft.Text("إدارة المستخدمين والصلاحيات", size=24, weight=ft.FontWeight.BOLD, color=COLORS['dark']),
             ft.Row([
-                ft.ElevatedButton(
-                    "➕ إضافة مستخدم جديد",
-                    icon=ft.icons.ADD,
-                    style=ft.ButtonStyle(bgcolor=COLORS['success'], color=COLORS['white']),
-                    on_click=lambda e: self._add_user_dialog(),
+                ft.TextField(
+                    hint_text="بحث...",
+                    width=250,
+                    height=40,
+                    border_radius=8,
+                    text_align=ft.TextAlign.RIGHT,
+                    prefix=ft.Icon(ft.icons.SEARCH),
+                    on_change=self.filter_users,
+                    ref=ft.Ref[ft.TextField]()
                 ),
                 ft.ElevatedButton(
-                    "🔑 تغيير كلمة مرور المدير",
-                    style=ft.ButtonStyle(bgcolor=COLORS['warning'], color=COLORS['white']),
-                    on_click=lambda e: self._change_admin_password_dialog(),
+                    text="إضافة مستخدم جديد",
+                    icon=ft.icons.PERSON_ADD,
+                    bgcolor=COLORS['success'],
+                    color=COLORS['white'],
+                    style=ft.ButtonStyle(
+                        shape=ft.RoundedRectangleBorder(radius=8),
+                    ),
+                    on_click=self.show_add_user_dialog
                 ),
-            ]),
+                ft.ElevatedButton(
+                    text="تغيير كلمة مرور المدير",
+                    icon=ft.icons.LOCK_RESET,
+                    bgcolor=COLORS['warning'],
+                    color=COLORS['white'],
+                    style=ft.ButtonStyle(
+                        shape=ft.RoundedRectangleBorder(radius=8),
+                    ),
+                    on_click=self.show_change_admin_password
+                ),
+            ])
         ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN)
-
-        self.user_search_field = ft.TextField(
-            hint_text="🔍 بحث في المستخدمين",
-            width=250,
-            on_change=self.filter_users,
-        )
-
+        
+        self.content_column.controls.append(title_row)
+        self.content_column.controls.append(ft.Container(height=20))
+        
+        # تخزين مرجع حقل البحث
+        self.user_search_field = title_row.controls[1].controls[0]
+        
+        # جدول المستخدمين
         self.user_table = ft.DataTable(
             columns=[
-                ft.DataColumn(ft.Text("المعرف")),
-                ft.DataColumn(ft.Text("اسم المستخدم")),
-                ft.DataColumn(ft.Text("الاسم الكامل")),
-                ft.DataColumn(ft.Text("الدور")),
-                ft.DataColumn(ft.Text("الحالة")),
-                ft.DataColumn(ft.Text("آخر تسجيل")),
-                ft.DataColumn(ft.Text("الإجراءات")),
+                ft.DataColumn(ft.Text("المعرف", size=14, weight=ft.FontWeight.BOLD)),
+                ft.DataColumn(ft.Text("اسم المستخدم", size=14, weight=ft.FontWeight.BOLD)),
+                ft.DataColumn(ft.Text("الاسم الكامل", size=14, weight=ft.FontWeight.BOLD)),
+                ft.DataColumn(ft.Text("الدور", size=14, weight=ft.FontWeight.BOLD)),
+                ft.DataColumn(ft.Text("الحالة", size=14, weight=ft.FontWeight.BOLD)),
+                ft.DataColumn(ft.Text("آخر تسجيل", size=14, weight=ft.FontWeight.BOLD)),
+                ft.DataColumn(ft.Text("الإجراءات", size=14, weight=ft.FontWeight.BOLD)),
             ],
             rows=[],
-            border=ft.border.all(1, COLORS['gray']),
-            border_radius=10,
-            vertical_lines=ft.border.BorderSide(1, COLORS['light']),
-            horizontal_lines=ft.border.BorderSide(1, COLORS['light']),
-            column_spacing=15,
+            horizontal_margin=10,
+            column_spacing=20,
+            heading_row_color=COLORS['light'],
+            heading_row_height=50,
             data_row_max_height=60,
+            expand=True
         )
-
-        self.content_column.controls.extend([
-            ft.Container(
-                content=ft.Column([
-                    header,
-                    ft.Row([self.user_search_field], alignment=ft.MainAxisAlignment.END),
-                    ft.Container(
-                        content=self.user_table,
-                        padding=10,
-                        bgcolor=COLORS['white'],
-                        border_radius=10,
-                        expand=True,
-                    ),
-                ]),
-                padding=ft.padding.only(left=25, right=25, top=20, bottom=20),
-                expand=True,
-            )
-        ])
-
-        self._load_users()
-
-    def _load_users(self, search=""):
-        if search:
-            users = self.db.execute_query("""
-                SELECT id, username, full_name, role, is_active, last_login 
-                FROM users 
-                WHERE username LIKE ? OR full_name LIKE ?
-                ORDER BY id
-            """, (f'%{search}%', f'%{search}%'))
-        else:
-            users = self.db.execute_query("""
-                SELECT id, username, full_name, role, is_active, last_login 
-                FROM users 
-                ORDER BY id
-            """)
-
-        rows = []
+        
+        # حاوية الجدول مع التمرير
+        table_container = ft.Container(
+            content=ft.Column([
+                self.user_table
+            ], scroll=ft.ScrollMode.AUTO),
+            expand=True,
+            bgcolor=COLORS['white'],
+            border_radius=10,
+            border=ft.border.all(1, COLORS['gray']),
+            padding=15
+        )
+        
+        self.content_column.controls.append(table_container)
+        self.load_users()
+        self.page.update()
+    
+    def load_users(self):
+        """تحميل قائمة المستخدمين"""
+        if not self.user_table:
+            return
+        
+        self.user_table.rows.clear()
+        
+        users = self.db.execute_query("""
+            SELECT id, username, full_name, role, is_active, last_login 
+            FROM users 
+            ORDER BY id
+        """)
+        
         for user in users:
             uid, username, full_name, role, is_active, last_login = user
             role_text = "مدير" if role == 'admin' else "مشغل"
             status_text = "نشط" if is_active else "غير نشط"
             status_color = COLORS['success'] if is_active else COLORS['danger']
             last_login_text = last_login[:16] if last_login else "لم يسجل دخول"
-
-            actions = ft.Row(spacing=5)
-            actions.controls.append(
+            
+            # أزرار الإجراءات
+            actions_row = ft.Row(spacing=5)
+            
+            actions_row.controls.append(
                 ft.IconButton(
                     icon=ft.icons.EDIT,
                     icon_size=18,
-                    icon_color=COLORS['white'],
-                    bgcolor=COLORS['primary'],
+                    icon_color=COLORS['primary'],
                     tooltip="تعديل",
-                    on_click=lambda e, uid=uid, un=username: self._edit_user_dialog(uid, un),
+                    on_click=lambda e, uid=uid, un=username: self.edit_user(uid, un)
                 )
             )
-            actions.controls.append(
+            
+            actions_row.controls.append(
                 ft.IconButton(
                     icon=ft.icons.SECURITY,
                     icon_size=18,
-                    icon_color=COLORS['white'],
-                    bgcolor=COLORS['purple'],
-                    tooltip="الصلاحيات",
-                    on_click=lambda e, uid=uid, un=username: self._manage_permissions_dialog(uid, un),
+                    icon_color=COLORS['purple'],
+                    tooltip="صلاحيات",
+                    on_click=lambda e, uid=uid, un=username: self.manage_user_permissions(uid, un)
                 )
             )
-            actions.controls.append(
+            
+            actions_row.controls.append(
                 ft.IconButton(
-                    icon=ft.icons.PASSWORD,
+                    icon=ft.icons.LOCK_RESET,
                     icon_size=18,
-                    icon_color=COLORS['white'],
-                    bgcolor=COLORS['warning'],
+                    icon_color=COLORS['warning'],
                     tooltip="تغيير كلمة المرور",
-                    on_click=lambda e, uid=uid, un=username: self._change_user_password_dialog(uid, un),
+                    on_click=lambda e, uid=uid, un=username: self.change_password(uid, un)
                 )
             )
+            
             if username != DEFAULT_USER:
-                actions.controls.append(
-                    ft.IconButton(
-                        icon=ft.icons.ENABLED_USERS if is_active else ft.icons.DISABLED_BY_DEFAULT,
-                        icon_size=18,
-                        icon_color=COLORS['white'],
-                        bgcolor=COLORS['danger'] if is_active else COLORS['success'],
-                        tooltip="تعطيل" if is_active else "تفعيل",
-                        on_click=lambda e, uid=uid, un=username, act=not is_active: self._toggle_user_status(uid, un, act),
-                    )
-                )
-                actions.controls.append(
+                actions_row.controls.append(
                     ft.IconButton(
                         icon=ft.icons.DELETE,
                         icon_size=18,
-                        icon_color=COLORS['white'],
-                        bgcolor=COLORS['danger'],
+                        icon_color=COLORS['danger'],
                         tooltip="حذف",
-                        on_click=lambda e, uid=uid, un=username: self._delete_user_confirm(uid, un),
+                        on_click=lambda e, uid=uid, un=username: self.delete_user(uid, un)
                     )
                 )
-
-            rows.append(
+                
+                status_icon = ft.IconButton(
+                    icon=ft.icons.CANCEL if is_active else ft.icons.CHECK_CIRCLE,
+                    icon_size=18,
+                    icon_color=COLORS['danger'] if is_active else COLORS['success'],
+                    tooltip="تعطيل" if is_active else "تفعيل",
+                    on_click=lambda e, uid=uid, un=username, act=not is_active: 
+                        self.toggle_user_status(uid, un, act)
+                )
+                actions_row.controls.append(status_icon)
+            
+            self.user_table.rows.append(
                 ft.DataRow(
                     cells=[
-                        ft.DataCell(ft.Text(str(uid))),
-                        ft.DataCell(ft.Text(username)),
-                        ft.DataCell(ft.Text(full_name or "")),
-                        ft.DataCell(ft.Text(role_text)),
+                        ft.DataCell(ft.Text(str(uid), size=13)),
+                        ft.DataCell(ft.Text(username, size=13)),
+                        ft.DataCell(ft.Text(full_name or "", size=13)),
+                        ft.DataCell(ft.Text(role_text, size=13)),
                         ft.DataCell(ft.Container(
-                            content=ft.Text(status_text),
-                            bgcolor=status_color + '20',
-                            padding=ft.padding.symmetric(horizontal=8, vertical=2),
-                            border_radius=12,
+                            content=ft.Text(status_text, size=12, color=COLORS['white']),
+                            bgcolor=status_color,
+                            padding=ft.padding.symmetric(horizontal=8, vertical=4),
+                            border_radius=4
                         )),
-                        ft.DataCell(ft.Text(last_login_text)),
-                        ft.DataCell(actions),
+                        ft.DataCell(ft.Text(last_login_text, size=13)),
+                        ft.DataCell(actions_row),
                     ]
                 )
             )
-        self.user_table.rows = rows
+        
         self.page.update()
-
+    
     def filter_users(self, e):
-        self._load_users(self.user_search_field.value.strip())
-
-    def _add_user_dialog(self):
-        username_field = ft.TextField(label="اسم المستخدم", width=350, autofocus=True)
-        password_field = ft.TextField(label="كلمة المرور", width=350, password=True, can_reveal_password=True)
-        confirm_field = ft.TextField(label="تأكيد كلمة المرور", width=350, password=True, can_reveal_password=True)
-        fullname_field = ft.TextField(label="الاسم الكامل", width=350)
+        """فلترة المستخدمين حسب البحث"""
+        if not self.user_table:
+            return
+        
+        search_text = e.control.value.strip().lower() if e.control.value else ""
+        
+        for row in self.user_table.rows[:]:
+            username_cell = row.cells[1].content
+            fullname_cell = row.cells[2].content
+            
+            match = False
+            if isinstance(username_cell, ft.Text):
+                if search_text in username_cell.value.lower():
+                    match = True
+            if isinstance(fullname_cell, ft.Text):
+                if search_text in fullname_cell.value.lower():
+                    match = True
+            
+            if search_text and not match:
+                self.user_table.rows.remove(row)
+        
+        self.page.update()
+    
+    def show_add_user_dialog(self, e):
+        """عرض نافذة إضافة مستخدم جديد"""
+        # حقول الإدخال
+        username_field = ft.TextField(
+            label="اسم المستخدم",
+            width=300,
+            border_radius=8,
+            text_align=ft.TextAlign.RIGHT,
+            autofocus=True
+        )
+        
+        password_field = ft.TextField(
+            label="كلمة المرور",
+            width=300,
+            password=True,
+            can_reveal_password=True,
+            text_align=ft.TextAlign.RIGHT
+        )
+        
+        confirm_field = ft.TextField(
+            label="تأكيد كلمة المرور",
+            width=300,
+            password=True,
+            can_reveal_password=True,
+            text_align=ft.TextAlign.RIGHT
+        )
+        
+        fullname_field = ft.TextField(
+            label="الاسم الكامل",
+            width=300,
+            text_align=ft.TextAlign.RIGHT
+        )
+        
         role_dropdown = ft.Dropdown(
             label="الدور",
-            width=350,
+            width=300,
             options=[
                 ft.dropdown.Option("مشغل"),
                 ft.dropdown.Option("مدير"),
             ],
-            value="مشغل",
+            value="مشغل"
         )
-
-        def save(e):
-            username = username_field.value.strip()
-            password = password_field.value.strip()
-            confirm = confirm_field.value.strip()
-            fullname = fullname_field.value.strip()
+        
+        def save_user(e):
+            username = username_field.value.strip() if username_field.value else ""
+            password = password_field.value.strip() if password_field.value else ""
+            confirm = confirm_field.value.strip() if confirm_field.value else ""
+            fullname = fullname_field.value or ""
             role_text = role_dropdown.value
+            
             if not username or not password:
                 self.show_snack_bar("الرجاء إدخال اسم المستخدم وكلمة المرور", COLORS['danger'])
                 return
+            
             if password != confirm:
                 self.show_snack_bar("كلمة المرور غير متطابقة", COLORS['danger'])
                 return
+            
             role = "admin" if role_text == "مدير" else "operator"
+            
             try:
                 user_id = self.db.execute_insert(
                     """INSERT INTO users (username, password, full_name, role, is_active, created_by) 
                        VALUES (?, ?, ?, ?, 1, ?)""",
                     (username, password, fullname, role, self.current_user['id'])
                 )
+                
                 permissions = DEFAULT_PERMISSIONS.copy()
                 if role == 'admin':
                     for key in permissions:
                         permissions[key] = 1
+                
                 self.db.update_user_permissions(user_id, permissions)
-                self.db.log_action(self.current_user['id'], 'add_user', f'إضافة مستخدم جديد {username}')
-                self.close_dialog()
+                self.db.log_action(self.current_user['id'], 'add_user',
+                                  f'إضافة مستخدم جديد {username}')
+                
+                dialog.open = False
+                self.page.update()
                 self.show_snack_bar("تم إضافة المستخدم بنجاح", COLORS['success'])
-                self._load_users()
+                self.load_users()
+                
             except sqlite3.IntegrityError:
                 self.show_snack_bar("اسم المستخدم موجود مسبقاً", COLORS['danger'])
-
+        
         dialog = ft.AlertDialog(
-            title=ft.Text("إضافة مستخدم جديد", weight=ft.FontWeight.BOLD),
+            title=ft.Text("إضافة مستخدم جديد", size=18, weight=ft.FontWeight.BOLD),
             content=ft.Container(
+                width=350,
                 content=ft.Column([
                     username_field,
                     password_field,
                     confirm_field,
                     fullname_field,
                     role_dropdown,
-                ], width=400, spacing=15, scroll=ft.ScrollMode.AUTO),
-                padding=10,
+                ], spacing=15, scroll=ft.ScrollMode.AUTO),
+                padding=10
             ),
             actions=[
-                ft.TextButton("حفظ", on_click=save),
-                ft.TextButton("إلغاء", on_click=self.close_dialog),
+                ft.TextButton("إلغاء", on_click=lambda e: self.close_dialog(dialog)),
+                ft.ElevatedButton("حفظ", on_click=save_user, bgcolor=COLORS['success'], color=COLORS['white']),
             ],
             actions_alignment=ft.MainAxisAlignment.END,
         )
+        
         self.page.dialog = dialog
         dialog.open = True
         self.page.update()
-
-    def _edit_user_dialog(self, user_id, username):
+    
+    def edit_user(self, user_id, username):
+        """تعديل بيانات المستخدم"""
         result = self.db.execute_query(
             "SELECT full_name, role FROM users WHERE id = ?",
             (user_id,)
         )
+        
         if not result:
             self.show_snack_bar("المستخدم غير موجود", COLORS['danger'])
             return
+        
         fullname, role = result[0]
-
-        username_display = ft.TextField(label="اسم المستخدم", width=350, value=username, read_only=True)
-        fullname_field = ft.TextField(label="الاسم الكامل", width=350, value=fullname or "")
+        
+        # حقول الإدخال
+        username_display = ft.TextField(
+            label="اسم المستخدم",
+            width=300,
+            value=username,
+            read_only=True,
+            border_radius=8,
+            text_align=ft.TextAlign.RIGHT
+        )
+        
+        fullname_field = ft.TextField(
+            label="الاسم الكامل",
+            width=300,
+            value=fullname or "",
+            text_align=ft.TextAlign.RIGHT
+        )
+        
         role_dropdown = ft.Dropdown(
             label="الدور",
-            width=350,
+            width=300,
             options=[
                 ft.dropdown.Option("مشغل"),
                 ft.dropdown.Option("مدير"),
             ],
-            value="مدير" if role == 'admin' else "مشغل",
+            value="مدير" if role == 'admin' else "مشغل"
         )
-
-        def save(e):
-            new_fullname = fullname_field.value.strip()
+        
+        def save_edit(e):
+            new_fullname = fullname_field.value or ""
             new_role_text = role_dropdown.value
             new_role = "admin" if new_role_text == "مدير" else "operator"
+            
             self.db.execute_query(
                 "UPDATE users SET full_name = ?, role = ? WHERE id = ?",
                 (new_fullname, new_role, user_id)
             )
+            
             if new_role == 'admin':
                 permissions = DEFAULT_PERMISSIONS.copy()
                 for key in permissions:
                     permissions[key] = 1
                 self.db.update_user_permissions(user_id, permissions)
-            self.db.log_action(self.current_user['id'], 'edit_user', f'تعديل بيانات المستخدم {username}')
-            self.close_dialog()
+            
+            self.db.log_action(self.current_user['id'], 'edit_user',
+                              f'تعديل بيانات المستخدم {username}')
+            
+            dialog.open = False
+            self.page.update()
             self.show_snack_bar("تم تحديث بيانات المستخدم بنجاح", COLORS['success'])
-            self._load_users()
-
+            self.load_users()
+        
         dialog = ft.AlertDialog(
-            title=ft.Text(f"تعديل بيانات المستخدم: {username}", weight=ft.FontWeight.BOLD),
+            title=ft.Text(f"تعديل بيانات المستخدم: {username}", size=18, weight=ft.FontWeight.BOLD),
             content=ft.Container(
-                content=ft.Column([username_display, fullname_field, role_dropdown],
-                                  width=400, spacing=15, scroll=ft.ScrollMode.AUTO),
-                padding=10,
+                width=350,
+                content=ft.Column([
+                    username_display,
+                    fullname_field,
+                    role_dropdown,
+                ], spacing=15),
+                padding=10
             ),
             actions=[
-                ft.TextButton("حفظ", on_click=save),
-                ft.TextButton("إلغاء", on_click=self.close_dialog),
+                ft.TextButton("إلغاء", on_click=lambda e: self.close_dialog(dialog)),
+                ft.ElevatedButton("حفظ", on_click=save_edit, bgcolor=COLORS['success'], color=COLORS['white']),
             ],
             actions_alignment=ft.MainAxisAlignment.END,
         )
+        
         self.page.dialog = dialog
         dialog.open = True
         self.page.update()
-
-    def _manage_permissions_dialog(self, user_id, username):
+    
+    def manage_user_permissions(self, user_id, username):
+        """إدارة صلاحيات المستخدم"""
         permissions = self.db.get_user_permissions(user_id)
-
+        
         # مجموعات الصلاحيات
         groups = [
             ("لوحة التحكم", ['can_view_dashboard']),
@@ -2987,7 +3859,7 @@ class CartsManagementApp:
             ("إدارة النظام", ['can_manage_users', 'can_manage_backup']),
             ("إعدادات المستخدم", ['can_change_own_password'])
         ]
-
+        
         permission_labels = {
             'can_view_dashboard': 'عرض لوحة التحكم',
             'can_manage_carts': 'إدارة العربات',
@@ -3008,10 +3880,10 @@ class CartsManagementApp:
             'can_manage_backup': 'إدارة النسخ الاحتياطي',
             'can_change_own_password': 'تغيير كلمة المرور الشخصية'
         }
-
+        
         permission_vars = {}
-
-        content = ft.Column(spacing=15, scroll=ft.ScrollMode.AUTO)
+        permission_controls = []
+        
         for group_name, perm_list in groups:
             group_controls = []
             for perm in perm_list:
@@ -3019,504 +3891,946 @@ class CartsManagementApp:
                     var = ft.Checkbox(
                         label=permission_labels[perm],
                         value=permissions.get(perm, 0) == 1,
+                        fill_color=COLORS['primary']
                     )
                     permission_vars[perm] = var
                     group_controls.append(var)
+            
             if group_controls:
-                content.controls.append(
+                permission_controls.append(
                     ft.Container(
                         content=ft.Column([
-                            ft.Text(group_name, weight=ft.FontWeight.BOLD, size=16),
+                            ft.Text(group_name, size=16, weight=ft.FontWeight.BOLD, color=COLORS['dark']),
                             ft.Column(group_controls, spacing=5),
+                            ft.Divider(height=1, color=COLORS['light']),
                         ]),
-                        padding=10,
-                        border=ft.border.all(1, COLORS['light']),
-                        border_radius=8,
+                        padding=10
                     )
                 )
-
-        def save(e):
-            new_perms = {}
-            for key, var in permission_vars.items():
-                new_perms[key] = 1 if var.value else 0
-            self.db.update_user_permissions(user_id, new_perms)
-            self.db.log_action(self.current_user['id'], 'edit_permissions',
-                               f'تعديل صلاحيات المستخدم {username}')
-            if user_id == self.current_user['id']:
-                self.current_permissions = self.db.get_user_permissions(user_id)
-            self.close_dialog()
-            self.show_snack_bar(f"تم تحديث صلاحيات المستخدم {username}", COLORS['success'])
-
+        
         def select_all(e):
             for var in permission_vars.values():
                 var.value = True
             self.page.update()
-
+        
         def deselect_all(e):
             for var in permission_vars.values():
                 var.value = False
             self.page.update()
-
+        
+        def save_permissions(e):
+            new_permissions = {}
+            for key, var in permission_vars.items():
+                new_permissions[key] = 1 if var.value else 0
+            
+            self.db.update_user_permissions(user_id, new_permissions)
+            self.db.log_action(self.current_user['id'], 'edit_permissions',
+                              f'تعديل صلاحيات المستخدم {username}')
+            
+            if user_id == self.current_user['id']:
+                self.current_permissions = self.db.get_user_permissions(user_id)
+            
+            dialog.open = False
+            self.page.update()
+            self.show_snack_bar(f"تم تحديث صلاحيات المستخدم {username} بنجاح", COLORS['success'])
+        
         dialog = ft.AlertDialog(
-            title=ft.Text(f"صلاحيات المستخدم: {username}", weight=ft.FontWeight.BOLD),
+            title=ft.Text(f"صلاحيات المستخدم: {username}", size=18, weight=ft.FontWeight.BOLD),
             content=ft.Container(
-                content=content,
                 width=600,
                 height=500,
-                padding=10,
+                content=ft.Column(
+                    permission_controls,
+                    scroll=ft.ScrollMode.AUTO,
+                    spacing=10
+                ),
+                padding=10
             ),
             actions=[
-                ft.TextButton("✅ تحديد الكل", on_click=select_all),
-                ft.TextButton("❎ إلغاء الكل", on_click=deselect_all),
-                ft.TextButton("💾 حفظ الصلاحيات", on_click=save),
-                ft.TextButton("إلغاء", on_click=self.close_dialog),
+                ft.TextButton("تحديد الكل", on_click=select_all),
+                ft.TextButton("إلغاء الكل", on_click=deselect_all),
+                ft.TextButton("إلغاء", on_click=lambda e: self.close_dialog(dialog)),
+                ft.ElevatedButton("حفظ", on_click=save_permissions, bgcolor=COLORS['success'], color=COLORS['white']),
             ],
             actions_alignment=ft.MainAxisAlignment.END,
         )
+        
         self.page.dialog = dialog
         dialog.open = True
         self.page.update()
-
-    def _change_user_password_dialog(self, user_id, username):
-        new_pass = ft.TextField(label="كلمة المرور الجديدة", width=350, password=True, can_reveal_password=True)
-        confirm_pass = ft.TextField(label="تأكيد كلمة المرور", width=350, password=True, can_reveal_password=True)
-
-        def save(e):
-            new = new_pass.value.strip()
-            confirm = confirm_pass.value.strip()
-            if not new:
+    
+    def show_change_admin_password(self, e):
+        """تغيير كلمة مرور المدير الرئيسي"""
+        # حقول الإدخال
+        current_pass_field = ft.TextField(
+            label="كلمة المرور الحالية",
+            width=300,
+            password=True,
+            can_reveal_password=True,
+            text_align=ft.TextAlign.RIGHT,
+            autofocus=True
+        )
+        
+        new_pass_field = ft.TextField(
+            label="كلمة المرور الجديدة",
+            width=300,
+            password=True,
+            can_reveal_password=True,
+            text_align=ft.TextAlign.RIGHT
+        )
+        
+        confirm_pass_field = ft.TextField(
+            label="تأكيد كلمة المرور",
+            width=300,
+            password=True,
+            can_reveal_password=True,
+            text_align=ft.TextAlign.RIGHT
+        )
+        
+        def save_password(e):
+            current_pass = current_pass_field.value.strip() if current_pass_field.value else ""
+            new_pass = new_pass_field.value.strip() if new_pass_field.value else ""
+            confirm_pass = confirm_pass_field.value.strip() if confirm_pass_field.value else ""
+            
+            result = self.db.execute_query(
+                "SELECT id FROM users WHERE username = ? AND password = ?",
+                (DEFAULT_USER, current_pass)
+            )
+            
+            if not result:
+                self.show_snack_bar("كلمة المرور الحالية غير صحيحة", COLORS['danger'])
+                return
+            
+            if not new_pass:
                 self.show_snack_bar("الرجاء إدخال كلمة المرور الجديدة", COLORS['danger'])
                 return
-            if new != confirm:
+            
+            if new_pass != confirm_pass:
                 self.show_snack_bar("كلمة المرور غير متطابقة", COLORS['danger'])
                 return
+            
+            admin_id = self.db.execute_query(
+                "SELECT id FROM users WHERE username = ?",
+                (DEFAULT_USER,)
+            )[0][0]
+            
             self.db.execute_query(
                 "UPDATE users SET password = ? WHERE id = ?",
-                (new, user_id)
+                (new_pass, admin_id)
             )
-            self.db.log_action(self.current_user['id'], 'change_password',
-                               f'تغيير كلمة مرور المستخدم {username}')
-            self.close_dialog()
-            self.show_snack_bar("تم تغيير كلمة المرور بنجاح", COLORS['success'])
-
+            
+            self.db.log_action(self.current_user['id'], 'change_admin_password',
+                              'تغيير كلمة مرور المدير الرئيسي')
+            
+            dialog.open = False
+            self.page.update()
+            self.show_snack_bar("تم تغيير كلمة مرور المدير بنجاح", COLORS['success'])
+        
         dialog = ft.AlertDialog(
-            title=ft.Text(f"تغيير كلمة المرور - {username}", weight=ft.FontWeight.BOLD),
+            title=ft.Text("تغيير كلمة مرور المدير", size=18, weight=ft.FontWeight.BOLD),
             content=ft.Container(
-                content=ft.Column([new_pass, confirm_pass], width=400, spacing=15),
-                padding=10,
+                width=350,
+                content=ft.Column([
+                    current_pass_field,
+                    new_pass_field,
+                    confirm_pass_field,
+                ], spacing=15),
+                padding=10
             ),
             actions=[
-                ft.TextButton("حفظ", on_click=save),
-                ft.TextButton("إلغاء", on_click=self.close_dialog),
+                ft.TextButton("إلغاء", on_click=lambda e: self.close_dialog(dialog)),
+                ft.ElevatedButton("حفظ", on_click=save_password, bgcolor=COLORS['success'], color=COLORS['white']),
             ],
             actions_alignment=ft.MainAxisAlignment.END,
         )
+        
         self.page.dialog = dialog
         dialog.open = True
         self.page.update()
-
-    def _toggle_user_status(self, user_id, username, activate):
+    
+    def change_password(self, user_id, username):
+        """تغيير كلمة مرور مستخدم"""
+        # حقول الإدخال
+        new_pass_field = ft.TextField(
+            label="كلمة المرور الجديدة",
+            width=300,
+            password=True,
+            can_reveal_password=True,
+            text_align=ft.TextAlign.RIGHT,
+            autofocus=True
+        )
+        
+        confirm_pass_field = ft.TextField(
+            label="تأكيد كلمة المرور",
+            width=300,
+            password=True,
+            can_reveal_password=True,
+            text_align=ft.TextAlign.RIGHT
+        )
+        
+        def save_password(e):
+            new_pass = new_pass_field.value.strip() if new_pass_field.value else ""
+            confirm_pass = confirm_pass_field.value.strip() if confirm_pass_field.value else ""
+            
+            if not new_pass:
+                self.show_snack_bar("الرجاء إدخال كلمة المرور الجديدة", COLORS['danger'])
+                return
+            
+            if new_pass != confirm_pass:
+                self.show_snack_bar("كلمة المرور غير متطابقة", COLORS['danger'])
+                return
+            
+            self.db.execute_query(
+                "UPDATE users SET password = ? WHERE id = ?",
+                (new_pass, user_id)
+            )
+            
+            self.db.log_action(self.current_user['id'], 'change_password',
+                              f'تغيير كلمة مرور المستخدم {username}')
+            
+            dialog.open = False
+            self.page.update()
+            self.show_snack_bar("تم تغيير كلمة المرور بنجاح", COLORS['success'])
+        
+        dialog = ft.AlertDialog(
+            title=ft.Text(f"تغيير كلمة المرور - {username}", size=18, weight=ft.FontWeight.BOLD),
+            content=ft.Container(
+                width=350,
+                content=ft.Column([
+                    new_pass_field,
+                    confirm_pass_field,
+                ], spacing=15),
+                padding=10
+            ),
+            actions=[
+                ft.TextButton("إلغاء", on_click=lambda e: self.close_dialog(dialog)),
+                ft.ElevatedButton("حفظ", on_click=save_password, bgcolor=COLORS['success'], color=COLORS['white']),
+            ],
+            actions_alignment=ft.MainAxisAlignment.END,
+        )
+        
+        self.page.dialog = dialog
+        dialog.open = True
+        self.page.update()
+    
+    def toggle_user_status(self, user_id, username, activate):
+        """تفعيل/تعطيل مستخدم"""
         status_text = "تفعيل" if activate else "تعطيل"
-
-        def confirm(e):
+        
+        def confirm_toggle(e):
             self.db.execute_query(
                 "UPDATE users SET is_active = ? WHERE id = ?",
                 (1 if activate else 0, user_id)
             )
+            
             self.db.log_action(self.current_user['id'], 'toggle_user',
-                               f'{status_text} المستخدم {username}')
-            self.close_dialog()
+                              f'{status_text} المستخدم {username}')
+            
+            dialog.open = False
+            self.page.update()
             self.show_snack_bar(f"تم {status_text} المستخدم بنجاح", COLORS['success'])
-            self._load_users()
-
+            self.load_users()
+        
+        def cancel_toggle(e):
+            dialog.open = False
+            self.page.update()
+        
         dialog = ft.AlertDialog(
-            title=ft.Text(f"تأكيد {status_text}", weight=ft.FontWeight.BOLD),
+            title=ft.Text(f"تأكيد {status_text} المستخدم"),
             content=ft.Text(f"هل أنت متأكد من {status_text} المستخدم '{username}'؟"),
             actions=[
-                ft.TextButton("نعم", on_click=confirm),
-                ft.TextButton("لا", on_click=self.close_dialog),
+                ft.TextButton("نعم", on_click=confirm_toggle),
+                ft.TextButton("لا", on_click=cancel_toggle),
             ],
             actions_alignment=ft.MainAxisAlignment.END,
         )
+        
         self.page.dialog = dialog
         dialog.open = True
         self.page.update()
-
-    def _delete_user_confirm(self, user_id, username):
+    
+    def delete_user(self, user_id, username):
+        """حذف مستخدم"""
         if username == DEFAULT_USER:
             self.show_snack_bar("لا يمكن حذف المستخدم الرئيسي", COLORS['danger'])
             return
-
-        def confirm(e):
+        
+        def confirm_delete(e):
             self.db.execute_query("DELETE FROM users WHERE id = ?", (user_id,))
-            self.db.log_action(self.current_user['id'], 'delete_user', f'حذف المستخدم {username}')
-            self.close_dialog()
+            self.db.log_action(self.current_user['id'], 'delete_user',
+                              f'حذف المستخدم {username}')
+            
+            dialog.open = False
+            self.page.update()
             self.show_snack_bar("تم حذف المستخدم بنجاح", COLORS['success'])
-            self._load_users()
-
+            self.load_users()
+        
+        def cancel_delete(e):
+            dialog.open = False
+            self.page.update()
+        
         dialog = ft.AlertDialog(
-            title=ft.Text("تأكيد الحذف", weight=ft.FontWeight.BOLD),
+            title=ft.Text("تأكيد الحذف"),
             content=ft.Text(f"هل أنت متأكد من حذف المستخدم '{username}'؟"),
             actions=[
-                ft.TextButton("نعم", on_click=confirm),
-                ft.TextButton("لا", on_click=self.close_dialog),
+                ft.TextButton("نعم", on_click=confirm_delete),
+                ft.TextButton("لا", on_click=cancel_delete),
             ],
             actions_alignment=ft.MainAxisAlignment.END,
         )
+        
         self.page.dialog = dialog
         dialog.open = True
         self.page.update()
-
-    def _change_admin_password_dialog(self):
-        current_pass = ft.TextField(label="كلمة المرور الحالية", width=350, password=True, can_reveal_password=True)
-        new_pass = ft.TextField(label="كلمة المرور الجديدة", width=350, password=True, can_reveal_password=True)
-        confirm_pass = ft.TextField(label="تأكيد كلمة المرور", width=350, password=True, can_reveal_password=True)
-
-        def save(e):
-            curr = current_pass.value.strip()
-            new = new_pass.value.strip()
-            confirm = confirm_pass.value.strip()
-            result = self.db.execute_query(
-                "SELECT id FROM users WHERE username = ? AND password = ?",
-                (DEFAULT_USER, curr)
-            )
-            if not result:
-                self.show_snack_bar("كلمة المرور الحالية غير صحيحة", COLORS['danger'])
-                return
-            if not new:
-                self.show_snack_bar("الرجاء إدخال كلمة المرور الجديدة", COLORS['danger'])
-                return
-            if new != confirm:
-                self.show_snack_bar("كلمة المرور غير متطابقة", COLORS['danger'])
-                return
-            admin_id = self.db.execute_query(
-                "SELECT id FROM users WHERE username = ?", (DEFAULT_USER,)
-            )[0][0]
-            self.db.execute_query(
-                "UPDATE users SET password = ? WHERE id = ?",
-                (new, admin_id)
-            )
-            self.db.log_action(self.current_user['id'], 'change_admin_password',
-                               'تغيير كلمة مرور المدير الرئيسي')
-            self.close_dialog()
-            self.show_snack_bar("تم تغيير كلمة مرور المدير بنجاح", COLORS['success'])
-
-        dialog = ft.AlertDialog(
-            title=ft.Text("تغيير كلمة مرور المدير الرئيسي", weight=ft.FontWeight.BOLD),
-            content=ft.Container(
-                content=ft.Column([current_pass, new_pass, confirm_pass], width=400, spacing=15),
-                padding=10,
-            ),
-            actions=[
-                ft.TextButton("حفظ", on_click=save),
-                ft.TextButton("إلغاء", on_click=self.close_dialog),
-            ],
-            actions_alignment=ft.MainAxisAlignment.END,
-        )
-        self.page.dialog = dialog
-        dialog.open = True
-        self.page.update()
-
-    # ------------------------------------------------------------
-    # إعدادات النظام (للمدير فقط)
-    # ------------------------------------------------------------
+    
+    # ================================ إعدادات النظام ================================
     def show_system_settings(self):
+        """عرض صفحة إعدادات النظام"""
         if self.current_user['role'] != 'admin':
             self.show_snack_bar("غير مصرح لك بالوصول إلى هذه الصفحة", COLORS['danger'])
             return
-
+        
         self.clear_content()
-
-        # إعدادات التطبيق
-        app_name = self.db.get_app_setting('app_name', APP_NAME)
-        company_name = self.db.get_app_setting('company_name', 'الرئاسة العامة لشؤون المسجد الحرام والمسجد النبوي')
+        
+        # عنوان الصفحة
+        self.content_column.controls.append(
+            ft.Text("إعدادات النظام", size=24, weight=ft.FontWeight.BOLD, color=COLORS['dark'])
+        )
+        self.content_column.controls.append(ft.Container(height=20))
+        
+        # ===== إعدادات التطبيق =====
+        app_settings_card = ft.Container(
+            bgcolor=COLORS['white'],
+            border_radius=10,
+            border=ft.border.all(1, COLORS['gray']),
+            padding=20,
+            content=ft.Column([
+                ft.Text("إعدادات التطبيق", size=18, weight=ft.FontWeight.BOLD, color=COLORS['dark']),
+                ft.Divider(height=1, color=COLORS['light']),
+                
+                ft.Container(
+                    content=ft.Column([
+                        ft.Text("اسم البرنامج:", size=14, weight=ft.FontWeight.BOLD),
+                        ft.TextField(
+                            value=self.db.get_app_setting('app_name', APP_NAME),
+                            width=400,
+                            border_radius=8,
+                            text_align=ft.TextAlign.RIGHT,
+                            ref=ft.Ref[ft.TextField]()
+                        ),
+                        ft.ElevatedButton(
+                            text="حفظ اسم البرنامج",
+                            icon=ft.icons.SAVE,
+                            bgcolor=COLORS['primary'],
+                            color=COLORS['white'],
+                            style=ft.ButtonStyle(
+                                shape=ft.RoundedRectangleBorder(radius=8),
+                            ),
+                            on_click=lambda e: self.save_app_name(e, app_name_field)
+                        ),
+                    ]),
+                    padding=10
+                ),
+                
+                ft.Divider(height=1, color=COLORS['light']),
+                
+                ft.Container(
+                    content=ft.Column([
+                        ft.Text("اسم الجهة المشغلة:", size=14, weight=ft.FontWeight.BOLD),
+                        ft.TextField(
+                            value=self.db.get_app_setting('company_name', 
+                                'الرئاسة العامة لشؤون المسجد الحرام والمسجد النبوي'),
+                            width=400,
+                            border_radius=8,
+                            text_align=ft.TextAlign.RIGHT,
+                            ref=ft.Ref[ft.TextField]()
+                        ),
+                        ft.ElevatedButton(
+                            text="حفظ اسم الجهة",
+                            icon=ft.icons.SAVE,
+                            bgcolor=COLORS['primary'],
+                            color=COLORS['white'],
+                            style=ft.ButtonStyle(
+                                shape=ft.RoundedRectangleBorder(radius=8),
+                            ),
+                            on_click=lambda e: self.save_company_name(e, company_name_field)
+                        ),
+                    ]),
+                    padding=10
+                )
+            ])
+        )
+        
+        # تخزين المراجع
+        app_name_field = app_settings_card.content.controls[2].content.controls[1]
+        company_name_field = app_settings_card.content.controls[4].content.controls[1]
+        
+        self.content_column.controls.append(app_settings_card)
+        self.content_column.controls.append(ft.Container(height=20))
+        
+        # ===== إعدادات MEGA =====
+        mega_settings_card = ft.Container(
+            bgcolor=COLORS['white'],
+            border_radius=10,
+            border=ft.border.all(1, COLORS['gray']),
+            padding=20,
+            content=ft.Column([
+                ft.Text("إعدادات النسخ الاحتياطي السحابي (MEGA)", size=18, weight=ft.FontWeight.BOLD, 
+                       color=COLORS['dark']),
+                ft.Divider(height=1, color=COLORS['light']),
+                
+                ft.Container(
+                    content=ft.Column([
+                        ft.Row([
+                            ft.Icon(
+                                name=ft.icons.CHECK_CIRCLE if MEGA_AVAILABLE else ft.icons.ERROR,
+                                color=COLORS['success'] if MEGA_AVAILABLE else COLORS['danger']
+                            ),
+                            ft.Text(
+                                "✓ مكتبة MEGA مثبتة - جاهز للعمل" if MEGA_AVAILABLE 
+                                else "✗ مكتبة MEGA غير مثبتة - يرجى تثبيتها: pip install mega.py",
+                                size=14,
+                                color=COLORS['success'] if MEGA_AVAILABLE else COLORS['danger']
+                            ),
+                        ]),
+                    ]),
+                    padding=10
+                ),
+                
+                ft.Divider(height=1, color=COLORS['light']),
+                
+                ft.Container(
+                    content=ft.Column([
+                        ft.Text("البريد الإلكتروني MEGA:", size=14, weight=ft.FontWeight.BOLD),
+                        ft.TextField(
+                            value=self.db.get_app_setting('mega_email', MEGA_EMAIL),
+                            width=400,
+                            border_radius=8,
+                            text_align=ft.TextAlign.RIGHT,
+                            ref=ft.Ref[ft.TextField]()
+                        ),
+                        ft.Text("كلمة مرور MEGA:", size=14, weight=ft.FontWeight.BOLD),
+                        ft.TextField(
+                            value=self.db.get_app_setting('mega_password', MEGA_PASSWORD),
+                            width=400,
+                            border_radius=8,
+                            text_align=ft.TextAlign.RIGHT,
+                            password=True,
+                            can_reveal_password=True,
+                            ref=ft.Ref[ft.TextField]()
+                        ),
+                        ft.ElevatedButton(
+                            text="حفظ إعدادات MEGA",
+                            icon=ft.icons.SAVE,
+                            bgcolor=COLORS['primary'],
+                            color=COLORS['white'],
+                            style=ft.ButtonStyle(
+                                shape=ft.RoundedRectangleBorder(radius=8),
+                            ),
+                            on_click=lambda e: self.save_mega_settings(e, mega_email_field, mega_pass_field)
+                        ),
+                    ]),
+                    padding=10
+                )
+            ])
+        )
+        
+        # تخزين المراجع
+        mega_email_field = mega_settings_card.content.controls[4].content.controls[1]
+        mega_pass_field = mega_settings_card.content.controls[4].content.controls[3]
+        
+        self.content_column.controls.append(mega_settings_card)
+        self.content_column.controls.append(ft.Container(height=20))
+        
+        # ===== معلومات النظام =====
+        info_card = ft.Container(
+            bgcolor=COLORS['white'],
+            border_radius=10,
+            border=ft.border.all(1, COLORS['gray']),
+            padding=20,
+            content=ft.Column([
+                ft.Text("معلومات النظام", size=18, weight=ft.FontWeight.BOLD, color=COLORS['dark']),
+                ft.Divider(height=1, color=COLORS['light']),
+                
+                ft.Container(
+                    content=ft.Column([
+                        ft.Text(f"إصدار النظام: 2.0.0", size=14),
+                        ft.Text(f"تاريخ الإصدار: 2025-02-12", size=14),
+                        ft.Text(f"المطور: قسم تقنية المعلومات", size=14),
+                        ft.Text(f"آخر تحديث: {datetime.now().strftime('%Y-%m-%d %H:%M')}", size=14),
+                        ft.Text(f"دعم MEGA: {'مفعل ✓' if MEGA_AVAILABLE else 'غير مفعل ✗'}", size=14),
+                    ]),
+                    padding=10
+                )
+            ])
+        )
+        
+        self.content_column.controls.append(info_card)
+        self.page.update()
+    
+    def save_app_name(self, e, field):
+        """حفظ اسم البرنامج"""
+        new_name = field.value.strip()
+        if new_name:
+            self.db.update_app_setting('app_name', new_name, self.current_user['id'])
+            self.db.log_action(self.current_user['id'], 'update_settings',
+                              f'تحديث اسم البرنامج إلى: {new_name}')
+            self.page.title = new_name
+            self.show_snack_bar("تم تحديث اسم البرنامج بنجاح", COLORS['success'])
+    
+    def save_company_name(self, e, field):
+        """حفظ اسم الجهة"""
+        new_name = field.value.strip()
+        if new_name:
+            self.db.update_app_setting('company_name', new_name, self.current_user['id'])
+            self.db.log_action(self.current_user['id'], 'update_settings',
+                              f'تحديث اسم الجهة إلى: {new_name}')
+            self.show_snack_bar("تم تحديث اسم الجهة بنجاح", COLORS['success'])
+    
+    def save_mega_settings(self, e, email_field, pass_field):
+        """حفظ إعدادات MEGA"""
+        new_email = email_field.value.strip()
+        new_pass = pass_field.value.strip()
+        
+        if new_email:
+            self.db.update_app_setting('mega_email', new_email, self.current_user['id'])
+        if new_pass:
+            self.db.update_app_setting('mega_password', new_pass, self.current_user['id'])
+        
+        self.db.log_action(self.current_user['id'], 'update_settings',
+                          'تحديث إعدادات MEGA')
+        
+        self.show_snack_bar("تم تحديث إعدادات MEGA بنجاح", COLORS['success'])
+    
+    # ================================ تغيير كلمة المرور الشخصية ================================
+    def show_change_password(self):
+        """عرض صفحة تغيير كلمة المرور الشخصية"""
+        if not self.check_permission('can_change_own_password'):
+            self.show_snack_bar("غير مصرح لك بتغيير كلمة المرور", COLORS['danger'])
+            return
+        
+        self.clear_content()
+        
+        # عنوان الصفحة
+        self.content_column.controls.append(
+            ft.Text("تغيير كلمة المرور الشخصية", size=24, weight=ft.FontWeight.BOLD, color=COLORS['dark'])
+        )
+        self.content_column.controls.append(ft.Container(height=20))
+        
+        # بطاقة تغيير كلمة المرور
+        change_pass_card = ft.Container(
+            width=500,
+            bgcolor=COLORS['white'],
+            border_radius=10,
+            border=ft.border.all(1, COLORS['gray']),
+            padding=30,
+            content=ft.Column([
+                ft.Text(f"المستخدم: {self.current_user['username']}", size=16, color=COLORS['gray']),
+                ft.Divider(height=20, color=COLORS['light']),
+                
+                ft.TextField(
+                    label="كلمة المرور الحالية",
+                    password=True,
+                    can_reveal_password=True,
+                    width=400,
+                    border_radius=8,
+                    text_align=ft.TextAlign.RIGHT,
+                    ref=ft.Ref[ft.TextField]()
+                ),
+                
+                ft.TextField(
+                    label="كلمة المرور الجديدة",
+                    password=True,
+                    can_reveal_password=True,
+                    width=400,
+                    border_radius=8,
+                    text_align=ft.TextAlign.RIGHT,
+                    ref=ft.Ref[ft.TextField]()
+                ),
+                
+                ft.TextField(
+                    label="تأكيد كلمة المرور",
+                    password=True,
+                    can_reveal_password=True,
+                    width=400,
+                    border_radius=8,
+                    text_align=ft.TextAlign.RIGHT,
+                    ref=ft.Ref[ft.TextField]()
+                ),
+                
+                ft.Container(height=20),
+                
+                ft.ElevatedButton(
+                    text="تغيير كلمة المرور",
+                    icon=ft.icons.LOCK_RESET,
+                    width=200,
+                    height=45,
+                    bgcolor=COLORS['success'],
+                    color=COLORS['white'],
+                    style=ft.ButtonStyle(
+                        shape=ft.RoundedRectangleBorder(radius=8),
+                    ),
+                    on_click=lambda e: self.save_own_password(
+                        e,
+                        current_field,
+                        new_field,
+                        confirm_field
+                    )
+                )
+            ], horizontal_alignment=ft.CrossAxisAlignment.CENTER)
+        )
+        
+        # تخزين المراجع
+        current_field = change_pass_card.content.controls[2]
+        new_field = change_pass_card.content.controls[3]
+        confirm_field = change_pass_card.content.controls[4]
+        
+        self.content_column.controls.append(
+            ft.Container(
+                content=change_pass_card,
+                alignment=ft.alignment.center
+            )
+        )
+        self.page.update()
+    
+    def save_own_password(self, e, current_field, new_field, confirm_field):
+        """حفظ كلمة المرور الشخصية الجديدة"""
+        current_pass = current_field.value.strip() if current_field.value else ""
+        new_pass = new_field.value.strip() if new_field.value else ""
+        confirm_pass = confirm_field.value.strip() if confirm_field.value else ""
+        
+        result = self.db.execute_query(
+            "SELECT id FROM users WHERE id = ? AND password = ?",
+            (self.current_user['id'], current_pass)
+        )
+        
+        if not result:
+            self.show_snack_bar("كلمة المرور الحالية غير صحيحة", COLORS['danger'])
+            return
+        
+        if not new_pass:
+            self.show_snack_bar("الرجاء إدخال كلمة المرور الجديدة", COLORS['danger'])
+            return
+        
+        if new_pass != confirm_pass:
+            self.show_snack_bar("كلمة المرور غير متطابقة", COLORS['danger'])
+            return
+        
+        self.db.execute_query(
+            "UPDATE users SET password = ? WHERE id = ?",
+            (new_pass, self.current_user['id'])
+        )
+        
+        self.db.log_action(self.current_user['id'], 'change_own_password',
+                          'تغيير كلمة المرور الشخصية')
+        
+        self.show_snack_bar("تم تغيير كلمة المرور بنجاح", COLORS['success'])
+    
+    # ================================ النسخ الاحتياطي MEGA ================================
+    def test_mega_connection(self):
+        """اختبار الاتصال بـ MEGA"""
+        if not MEGA_AVAILABLE:
+            return False, "❌ مكتبة MEGA غير مثبتة. قم بتشغيل: pip install mega.py"
+        
         mega_email = self.db.get_app_setting('mega_email', MEGA_EMAIL)
         mega_password = self.db.get_app_setting('mega_password', MEGA_PASSWORD)
-
-        app_name_field = ft.TextField(label="اسم البرنامج", width=400, value=app_name)
-        company_name_field = ft.TextField(label="اسم الجهة المشغلة", width=400, value=company_name)
-
-        def save_app_settings(e):
-            new_name = app_name_field.value.strip()
-            if new_name:
-                self.db.update_app_setting('app_name', new_name, self.current_user['id'])
-                self.page.title = new_name
-                if self.sidebar_app_name_text:
-                    self.sidebar_app_name_text.value = new_name
-                    self.sidebar_app_name_text.update()
-            new_company = company_name_field.value.strip()
-            if new_company:
-                self.db.update_app_setting('company_name', new_company, self.current_user['id'])
-            self.db.log_action(self.current_user['id'], 'update_settings', 'تحديث إعدادات التطبيق')
-            self.show_snack_bar("تم تحديث إعدادات التطبيق", COLORS['success'])
-
-        # إعدادات MEGA
-        mega_status = ft.Text(
-            "✓ مكتبة MEGA مثبتة - جاهز للعمل" if MEGA_AVAILABLE else "✗ مكتبة MEGA غير مثبتة - يرجى تثبيتها: pip install mega.py",
-            color=COLORS['success'] if MEGA_AVAILABLE else COLORS['danger'],
-        )
-        mega_email_field = ft.TextField(label="البريد الإلكتروني MEGA", width=400, value=mega_email)
-        mega_pass_field = ft.TextField(
-            label="كلمة مرور MEGA",
-            width=400,
-            value=mega_password,
-            password=True,
-            can_reveal_password=True,
-        )
-
-        def save_mega_settings(e):
-            new_email = mega_email_field.value.strip()
-            new_pass = mega_pass_field.value.strip()
-            if new_email:
-                self.db.update_app_setting('mega_email', new_email, self.current_user['id'])
-            if new_pass:
-                self.db.update_app_setting('mega_password', new_pass, self.current_user['id'])
-            self.db.log_action(self.current_user['id'], 'update_settings', 'تحديث إعدادات MEGA')
-            self.show_snack_bar("تم تحديث إعدادات MEGA", COLORS['success'])
-
-        self.content_column.controls.extend([
-            ft.Container(
-                content=ft.Column([
-                    ft.Text("إعدادات النظام", size=24, weight=ft.FontWeight.BOLD, color=COLORS['dark']),
-                    ft.Container(
-                        content=ft.Column([
-                            ft.Text("إعدادات التطبيق", size=18, weight=ft.FontWeight.BOLD),
-                            app_name_field,
-                            ft.ElevatedButton("💾 حفظ اسم البرنامج", on_click=save_app_settings),
-                            ft.Divider(),
-                            company_name_field,
-                            ft.ElevatedButton("💾 حفظ اسم الجهة", on_click=save_app_settings),
-                        ], spacing=15),
-                        padding=20,
-                        bgcolor=COLORS['white'],
-                        border_radius=10,
-                        margin=ft.margin.only(bottom=20),
-                    ),
-                    ft.Container(
-                        content=ft.Column([
-                            ft.Text("إعدادات النسخ الاحتياطي السحابي (MEGA)", size=18, weight=ft.FontWeight.BOLD),
-                            mega_status,
-                            ft.Divider(),
-                            mega_email_field,
-                            mega_pass_field,
-                            ft.ElevatedButton("💾 حفظ إعدادات MEGA", on_click=save_mega_settings),
-                        ], spacing=15),
-                        padding=20,
-                        bgcolor=COLORS['white'],
-                        border_radius=10,
-                        margin=ft.margin.only(bottom=20),
-                    ),
-                    ft.Container(
-                        content=ft.Column([
-                            ft.Text("معلومات النظام", size=18, weight=ft.FontWeight.BOLD),
-                            ft.Text(f"إصدار النظام: 2.0.0"),
-                            ft.Text(f"تاريخ الإصدار: 2025-02-12"),
-                            ft.Text(f"المطور: قسم تقنية المعلومات"),
-                            ft.Text(f"آخر تحديث: {datetime.now().strftime('%Y-%m-%d %H:%M')}"),
-                            ft.Text(f"دعم MEGA: {'مفعل ✓' if MEGA_AVAILABLE else 'غير مفعل ✗'}"),
-                        ], spacing=10),
-                        padding=20,
-                        bgcolor=COLORS['white'],
-                        border_radius=10,
-                    ),
-                ]),
-                padding=ft.padding.only(left=25, right=25, top=20, bottom=20),
-                expand=True,
-            )
-        ])
-        self.page.update()
-
-    # ------------------------------------------------------------
-    # النسخ الاحتياطي (للمدير فقط)
-    # ------------------------------------------------------------
+        
+        if not mega_email or not mega_password:
+            return False, "❌ بيانات MEGA غير مكتملة. أضفها في ملف .env أو إعدادات النظام"
+        
+        try:
+            mega = Mega()
+            m = mega.login(mega_email, mega_password)
+            account = m.get_user()
+            email = account.get('email', mega_email)
+            return True, f"✅ متصل بحساب: {email}"
+        except Exception as e:
+            error_msg = str(e)
+            if "Invalid email or password" in error_msg:
+                return False, "❌ البريد أو كلمة المرور غير صحيحين"
+            elif "timeout" in error_msg.lower():
+                return False, "❌ فشل الاتصال: تحقق من الإنترنت"
+            else:
+                return False, f"❌ خطأ: {error_msg[:50]}..."
+    
     def show_backup(self):
+        """عرض صفحة النسخ الاحتياطي"""
         if self.current_user['role'] != 'admin' or not self.check_permission('can_manage_backup'):
             self.show_snack_bar("غير مصرح لك بالوصول إلى هذه الصفحة", COLORS['danger'])
             return
-
+        
         self.clear_content()
-
-        self.backup_progress = ft.ProgressBar(width=400, value=0, visible=False)
-        self.backup_status = ft.Text("", color=COLORS['primary'])
-
-        def create_local_backup(e):
-            try:
-                self.backup_progress.visible = True
-                self.backup_progress.value = 0
-                self.backup_status.value = "جاري إنشاء النسخة الاحتياطية..."
-                self.page.update()
-
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                backup_filename = f"backup_{timestamp}.db"
-                backup_path = os.path.join(self.backup_dir, backup_filename)
-
-                self.backup_progress.value = 0.3
-                self.page.update()
-                shutil.copy2(DB_NAME, backup_path)
-                file_size = os.path.getsize(backup_path)
-
-                self.backup_progress.value = 0.7
-                self.page.update()
-
-                self.db.execute_insert(
-                    """INSERT INTO backups 
-                       (file_name, backup_type, user_id, file_size, file_path, status) 
-                       VALUES (?, 'local', ?, ?, ?, 'completed')""",
-                    (backup_filename, self.current_user['id'], file_size, backup_path)
+        
+        # عنوان الصفحة
+        self.content_column.controls.append(
+            ft.Text("النسخ الاحتياطي", size=24, weight=ft.FontWeight.BOLD, color=COLORS['dark'])
+        )
+        self.content_column.controls.append(ft.Container(height=20))
+        
+        # ===== إنشاء نسخة احتياطية =====
+        backup_card = ft.Container(
+            bgcolor=COLORS['white'],
+            border_radius=10,
+            border=ft.border.all(1, COLORS['gray']),
+            padding=20,
+            content=ft.Column([
+                ft.Text("إنشاء نسخة احتياطية", size=18, weight=ft.FontWeight.BOLD, color=COLORS['dark']),
+                ft.Divider(height=1, color=COLORS['light']),
+                
+                ft.Row([
+                    ft.ElevatedButton(
+                        text="💾 نسخ احتياطي محلي",
+                        icon=ft.icons.SAVE,
+                        bgcolor=COLORS['primary'],
+                        color=COLORS['white'],
+                        style=ft.ButtonStyle(
+                            shape=ft.RoundedRectangleBorder(radius=8),
+                            padding=ft.padding.symmetric(horizontal=25, vertical=15)
+                        ),
+                        on_click=self.create_local_backup
+                    ),
+                    
+                    ft.ElevatedButton(
+                        text="☁️ نسخ احتياطي سحابي (MEGA)",
+                        icon=ft.icons.CLOUD_UPLOAD,
+                        bgcolor=COLORS['purple'] if MEGA_AVAILABLE else COLORS['gray'],
+                        color=COLORS['white'],
+                        style=ft.ButtonStyle(
+                            shape=ft.RoundedRectangleBorder(radius=8),
+                            padding=ft.padding.symmetric(horizontal=25, vertical=15)
+                        ),
+                        on_click=self.create_cloud_backup if MEGA_AVAILABLE else None,
+                        disabled=not MEGA_AVAILABLE
+                    ),
+                ]),
+                
+                ft.Container(height=20),
+                
+                # شريط التقدم
+                ft.ProgressBar(
+                    width=400,
+                    value=0,
+                    bgcolor=COLORS['light'],
+                    color=COLORS['primary'],
+                    ref=ft.Ref[ft.ProgressBar]()
+                ),
+                
+                ft.Container(height=10),
+                
+                # حالة النسخ
+                ft.Text("", size=14, ref=ft.Ref[ft.Text]()),
+            ])
+        )
+        
+        # تخزين المراجع
+        self.backup_progress = backup_card.content.controls[3].controls[2]
+        self.backup_status = backup_card.content.controls[3].controls[4]
+        
+        self.content_column.controls.append(backup_card)
+        self.content_column.controls.append(ft.Container(height=20))
+        
+        # ===== حالة MEGA =====
+        if MEGA_AVAILABLE:
+            mega_status = self.test_mega_connection()
+            mega_status_card = ft.Container(
+                bgcolor=COLORS['white'],
+                border_radius=10,
+                border=ft.border.all(1, COLORS['gray']),
+                padding=20,
+                content=ft.Row([
+                    ft.Text("حالة MEGA:", size=14, weight=ft.FontWeight.BOLD, color=COLORS['dark']),
+                    ft.Text(mega_status[1], size=14, color=COLORS['success'] if mega_status[0] else COLORS['danger']),
+                ])
+            )
+            self.content_column.controls.append(mega_status_card)
+            self.content_column.controls.append(ft.Container(height=20))
+        
+        # ===== سجل النسخ الاحتياطي =====
+        history_card = ft.Container(
+            bgcolor=COLORS['white'],
+            border_radius=10,
+            border=ft.border.all(1, COLORS['gray']),
+            padding=20,
+            expand=True,
+            content=ft.Column([
+                ft.Text("سجل النسخ الاحتياطي", size=18, weight=ft.FontWeight.BOLD, color=COLORS['dark']),
+                ft.Divider(height=1, color=COLORS['light']),
+                
+                ft.DataTable(
+                    columns=[
+                        ft.DataColumn(ft.Text("التاريخ", size=13, weight=ft.FontWeight.BOLD)),
+                        ft.DataColumn(ft.Text("اسم الملف", size=13, weight=ft.FontWeight.BOLD)),
+                        ft.DataColumn(ft.Text("النوع", size=13, weight=ft.FontWeight.BOLD)),
+                        ft.DataColumn(ft.Text("الحجم", size=13, weight=ft.FontWeight.BOLD)),
+                        ft.DataColumn(ft.Text("رابط MEGA", size=13, weight=ft.FontWeight.BOLD)),
+                        ft.DataColumn(ft.Text("الحالة", size=13, weight=ft.FontWeight.BOLD)),
+                        ft.DataColumn(ft.Text("المستخدم", size=13, weight=ft.FontWeight.BOLD)),
+                    ],
+                    rows=[],
+                    horizontal_margin=10,
+                    column_spacing=15,
+                    heading_row_color=COLORS['light'],
+                    heading_row_height=40,
+                    data_row_max_height=40,
+                    expand=True,
+                    ref=ft.Ref[ft.DataTable]()
                 )
-                self.backup_progress.value = 1.0
-                self.backup_status.value = "✅ تم إنشاء النسخة الاحتياطية المحلية بنجاح"
-                self.backup_status.color = COLORS['success']
-                self.page.update()
-                self.db.log_action(self.current_user['id'], 'backup_local',
-                                   f'إنشاء نسخة احتياطية محلية {backup_filename}')
-                self.show_snack_bar("تم إنشاء النسخة الاحتياطية المحلية", COLORS['success'])
-                self._load_backups()
-                # إخفاء بعد 3 ثوان
-                threading.Timer(3, self._hide_backup_progress).start()
-            except Exception as ex:
-                self.backup_status.value = f"❌ فشل: {str(ex)}"
-                self.backup_status.color = COLORS['danger']
-                self.page.update()
-                self.show_snack_bar(f"فشل النسخ الاحتياطي: {str(ex)}", COLORS['danger'])
-
-        def create_cloud_backup(e):
-            if not MEGA_AVAILABLE:
-                self.show_snack_bar("مكتبة MEGA غير مثبتة", COLORS['danger'])
-                return
+            ], expand=True)
+        )
+        
+        self.backup_tree = history_card.content.controls[1]
+        self.content_column.controls.append(history_card)
+        
+        self.load_backups()
+        self.page.update()
+    
+    def create_local_backup(self, e):
+        """إنشاء نسخة احتياطية محلية"""
+        try:
+            self.backup_progress.value = 0
+            self.backup_status.value = "جاري إنشاء النسخة الاحتياطية..."
+            self.backup_status.color = COLORS['primary']
+            self.page.update()
+            
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            backup_filename = f"backup_{timestamp}.db"
+            backup_path = os.path.join(self.backup_dir, backup_filename)
+            
+            self.update_progress(30, "جاري نسخ الملف...")
+            shutil.copy2(DB_NAME, backup_path)
+            
+            file_size = os.path.getsize(backup_path)
+            
+            self.update_progress(70, "جاري حفظ المعلومات...")
+            
+            self.db.execute_insert(
+                """INSERT INTO backups 
+                   (file_name, backup_type, user_id, file_size, file_path, status) 
+                   VALUES (?, 'local', ?, ?, ?, 'completed')""",
+                (backup_filename, self.current_user['id'], file_size, backup_path)
+            )
+            
+            self.update_progress(100, "✅ تم إنشاء النسخة الاحتياطية بنجاح", COLORS['success'])
+            
+            self.db.log_action(self.current_user['id'], 'backup_local',
+                              f'إنشاء نسخة احتياطية محلية {backup_filename}')
+            
+            self.show_snack_bar("تم إنشاء النسخة الاحتياطية المحلية بنجاح", COLORS['success'])
+            self.load_backups()
+            
+            time.sleep(3)
+            self.hide_progress()
+            
+        except Exception as ex:
+            self.update_progress(0, f"❌ فشل: {str(ex)}", COLORS['danger'])
+            self.show_snack_bar(f"فشل إنشاء النسخة الاحتياطية: {str(ex)}", COLORS['danger'])
+    
+    def create_cloud_backup(self, e):
+        """إنشاء نسخة احتياطية سحابية"""
+        if not MEGA_AVAILABLE:
+            self.show_snack_bar("مكتبة MEGA غير مثبتة", COLORS['danger'])
+            return
+        
+        mega_email = self.db.get_app_setting('mega_email', MEGA_EMAIL)
+        mega_password = self.db.get_app_setting('mega_password', MEGA_PASSWORD)
+        
+        if not mega_email or not mega_password:
+            self.show_snack_bar("بيانات MEGA غير موجودة. أضفها في ملف .env", COLORS['danger'])
+            return
+        
+        # إظهار شريط التقدم
+        self.backup_progress.value = 0
+        self.backup_status.value = "جاري الاتصال بـ MEGA..."
+        self.backup_status.color = COLORS['primary']
+        self.page.update()
+        
+        # تنفيذ في thread منفصل
+        def backup_thread():
             try:
-                self.backup_progress.visible = True
-                self.backup_progress.value = 0
-                self.backup_status.value = "جاري الاتصال بـ MEGA..."
-                self.page.update()
-
-                mega_email = os.environ.get('MEGA_EMAIL') or self.db.get_app_setting('mega_email', MEGA_EMAIL)
-                mega_password = os.environ.get('MEGA_PASSWORD') or self.db.get_app_setting('mega_password', MEGA_PASSWORD)
-
                 mega = Mega()
                 m = mega.login(mega_email, mega_password)
-
-                self.backup_progress.value = 0.2
-                self.backup_status.value = "جاري إنشاء النسخة المحلية..."
-                self.page.update()
-
+                self.update_progress(20, "جاري إنشاء النسخة المحلية...")
+                
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                 backup_filename = f"backup_cloud_{timestamp}.db"
                 backup_path = os.path.join(self.backup_dir, backup_filename)
-
+                
                 shutil.copy2(DB_NAME, backup_path)
                 file_size = os.path.getsize(backup_path)
-
-                self.backup_progress.value = 0.5
-                self.backup_status.value = "جاري الرفع إلى MEGA..."
-                self.page.update()
-
+                self.update_progress(50, "جاري الرفع إلى MEGA...")
+                
                 file = m.upload(backup_path)
                 link = m.get_upload_link(file)
-
-                self.backup_progress.value = 0.8
-                self.page.update()
-
+                self.update_progress(80, "جاري حفظ المعلومات...")
+                
                 self.db.execute_insert(
                     """INSERT INTO backups 
                        (file_name, backup_type, user_id, file_size, file_path, mega_link, status) 
                        VALUES (?, 'cloud', ?, ?, ?, ?, 'completed')""",
                     (backup_filename, self.current_user['id'], file_size, backup_path, link)
                 )
-                self.backup_progress.value = 1.0
-                self.backup_status.value = "✅ تم الرفع إلى MEGA بنجاح"
-                self.backup_status.color = COLORS['success']
-                self.page.update()
+                
+                self.update_progress(100, "✅ تم الرفع إلى MEGA بنجاح", COLORS['success'])
+                
                 self.db.log_action(self.current_user['id'], 'backup_cloud',
-                                   f'إنشاء نسخة احتياطية سحابية {backup_filename}')
-                self.show_snack_bar("تم إنشاء النسخة الاحتياطية السحابية", COLORS['success'])
-                self._load_backups()
-                threading.Timer(3, self._hide_backup_progress).start()
-            except Exception as ex:
-                self.backup_status.value = f"❌ فشل: {str(ex)}"
-                self.backup_status.color = COLORS['danger']
+                                  f'إنشاء نسخة احتياطية سحابية {backup_filename}')
+                
+                self.page.snack_bar = ft.SnackBar(
+                    content=ft.Text(f"✅ تم إنشاء النسخة الاحتياطية السحابية بنجاح", color=COLORS['white']),
+                    bgcolor=COLORS['success']
+                )
+                self.page.snack_bar.open = True
                 self.page.update()
-                self.show_snack_bar(f"فشل النسخ الاحتياطي السحابي: {str(ex)}", COLORS['danger'])
-
-        self._hide_backup_progress = lambda: (
-            setattr(self.backup_progress, 'visible', False),
-            setattr(self.backup_status, 'value', ''),
-            self.page.update()
-        )
-
-        # سجل النسخ الاحتياطي
-        self.backup_table = ft.DataTable(
-            columns=[
-                ft.DataColumn(ft.Text("التاريخ")),
-                ft.DataColumn(ft.Text("اسم الملف")),
-                ft.DataColumn(ft.Text("النوع")),
-                ft.DataColumn(ft.Text("الحجم")),
-                ft.DataColumn(ft.Text("رابط MEGA")),
-                ft.DataColumn(ft.Text("الحالة")),
-                ft.DataColumn(ft.Text("المستخدم")),
-            ],
-            rows=[],
-            border=ft.border.all(1, COLORS['gray']),
-            border_radius=10,
-            vertical_lines=ft.border.BorderSide(1, COLORS['light']),
-            horizontal_lines=ft.border.BorderSide(1, COLORS['light']),
-            column_spacing=15,
-            data_row_max_height=50,
-        )
-
-        self.content_column.controls.extend([
-            ft.Container(
-                content=ft.Column([
-                    ft.Text("النسخ الاحتياطي", size=24, weight=ft.FontWeight.BOLD, color=COLORS['dark']),
-                    ft.Container(
-                        content=ft.Column([
-                            ft.Text("إنشاء نسخة احتياطية", size=18, weight=ft.FontWeight.BOLD),
-                            ft.Row([
-                                ft.ElevatedButton(
-                                    "💾 نسخ احتياطي محلي",
-                                    style=ft.ButtonStyle(bgcolor=COLORS['primary'], color=COLORS['white']),
-                                    on_click=create_local_backup,
-                                ),
-                                ft.ElevatedButton(
-                                    "☁️ نسخ احتياطي سحابي (MEGA)",
-                                    style=ft.ButtonStyle(bgcolor=COLORS['purple'], color=COLORS['white']),
-                                    visible=MEGA_AVAILABLE,
-                                    on_click=create_cloud_backup,
-                                ),
-                            ]),
-                            ft.Row([self.backup_progress, self.backup_status], alignment=ft.MainAxisAlignment.START),
-                        ], spacing=15),
-                        padding=20,
-                        bgcolor=COLORS['white'],
-                        border_radius=10,
-                        margin=ft.margin.only(bottom=20),
-                    ),
-                    ft.Container(
-                        content=ft.Column([
-                            ft.Text("سجل النسخ الاحتياطي", size=18, weight=ft.FontWeight.BOLD),
-                            ft.Container(
-                                content=self.backup_table,
-                                padding=10,
-                                bgcolor=COLORS['white'],
-                                border_radius=10,
-                                expand=True,
-                                scroll=ft.ScrollMode.AUTO,
-                            ),
-                        ]),
-                        padding=20,
-                        bgcolor=COLORS['white'],
-                        border_radius=10,
-                        expand=True,
-                    ),
-                ]),
-                padding=ft.padding.only(left=25, right=25, top=20, bottom=20),
-                expand=True,
-            )
-        ])
-
-        self._load_backups()
-
-    def _load_backups(self):
+                
+                time.sleep(3)
+                self.hide_progress()
+                self.load_backups()
+                
+            except Exception as ex:
+                error_message = str(ex)
+                if "Invalid email or password" in error_message:
+                    msg = "❌ فشل تسجيل الدخول: البريد أو كلمة المرور غير صحيحين"
+                elif "timeout" in error_message.lower():
+                    msg = "❌ فشل الاتصال: تحقق من اتصالك بالإنترنت"
+                elif "disk quota" in error_message.lower():
+                    msg = "❌ مساحة التخزين السحابية غير كافية"
+                else:
+                    msg = f"❌ فشل: {error_message[:100]}"
+                
+                self.update_progress(0, msg, COLORS['danger'])
+                self.page.snack_bar = ft.SnackBar(
+                    content=ft.Text(msg, color=COLORS['white']),
+                    bgcolor=COLORS['danger']
+                )
+                self.page.snack_bar.open = True
+                self.page.update()
+                time.sleep(5)
+                self.hide_progress()
+        
+        threading.Thread(target=backup_thread, daemon=True).start()
+    
+    def update_progress(self, value, status_text, color=COLORS['primary']):
+        """تحديث شريط التقدم"""
+        self.backup_progress.value = value
+        self.backup_status.value = status_text
+        self.backup_status.color = color
+        self.page.update()
+    
+    def hide_progress(self):
+        """إخفاء شريط التقدم"""
+        if self.backup_progress:
+            self.backup_progress.value = 0
+        if self.backup_status:
+            self.backup_status.value = ""
+        self.page.update()
+    
+    def load_backups(self):
+        """تحميل سجل النسخ الاحتياطي"""
+        if not self.backup_tree:
+            return
+        
+        self.backup_tree.rows.clear()
+        
         backups = self.db.execute_query("""
             SELECT b.created_at, b.file_name, b.backup_type, b.file_size, 
                    b.mega_link, b.status, u.username
@@ -3525,106 +4839,75 @@ class CartsManagementApp:
             ORDER BY b.created_at DESC 
             LIMIT 50
         """)
-        rows = []
+        
         for backup in backups:
             created_at, filename, btype, file_size, mega_link, status, username = backup
+            
             type_text = "محلي" if btype == 'local' else "سحابي"
             status_text = "✓ مكتمل" if status == 'completed' else "✗ فشل"
-            status_color = COLORS['success'] if status == 'completed' else COLORS['danger']
+            
             if file_size:
                 if file_size < 1024:
                     size_text = f"{file_size} B"
                 elif file_size < 1024 * 1024:
                     size_text = f"{file_size / 1024:.1f} KB"
                 else:
-                    size_text = f"{file_size / (1024 * 1024):.1f} MB"
+                    size_text = f"{file_size / (1024*1024):.1f} MB"
             else:
                 size_text = "-"
+            
             link_text = mega_link[:30] + "..." if mega_link and len(mega_link) > 30 else (mega_link or "-")
-
-            rows.append(
+            
+            self.backup_tree.rows.append(
                 ft.DataRow(
                     cells=[
-                        ft.DataCell(ft.Text(created_at[:19] if created_at else "")),
-                        ft.DataCell(ft.Text(filename)),
-                        ft.DataCell(ft.Text(type_text)),
-                        ft.DataCell(ft.Text(size_text)),
-                        ft.DataCell(ft.Text(link_text)),
+                        ft.DataCell(ft.Text(created_at[:19] if created_at else "", size=12)),
+                        ft.DataCell(ft.Text(filename, size=12)),
+                        ft.DataCell(ft.Text(type_text, size=12)),
+                        ft.DataCell(ft.Text(size_text, size=12)),
+                        ft.DataCell(ft.Text(link_text, size=12)),
                         ft.DataCell(ft.Container(
-                            content=ft.Text(status_text),
-                            bgcolor=status_color + '20',
+                            content=ft.Text(status_text, size=12, color=COLORS['white']),
+                            bgcolor=COLORS['success'] if status == 'completed' else COLORS['danger'],
                             padding=ft.padding.symmetric(horizontal=8, vertical=2),
-                            border_radius=12,
+                            border_radius=4
                         )),
-                        ft.DataCell(ft.Text(username or "")),
+                        ft.DataCell(ft.Text(username or "", size=12)),
                     ]
                 )
             )
-        self.backup_table.rows = rows
+        
+        self.page.update()
+    
+    # ================================ دوال مساعدة للنوافذ ================================
+    def close_dialog(self, dialog):
+        """إغلاق نافذة الحوار"""
+        dialog.open = False
         self.page.update()
 
-    # ------------------------------------------------------------
-    # تغيير كلمة المرور الشخصية
-    # ------------------------------------------------------------
-    def show_change_password(self):
-        if not self.check_permission('can_change_own_password'):
-            self.show_snack_bar("غير مصرح لك بتغيير كلمة المرور", COLORS['danger'])
-            return
+# ================================ إنشاء ملف .env ================================
+def create_env_file():
+    """إنشاء ملف .env إذا لم يكن موجوداً"""
+    env_path = Path('.env')
+    if not env_path.exists():
+        env_content = """# إعدادات MEGA للنسخ الاحتياطي السحابي
+MEGA_EMAIL=your_email@example.com
+MEGA_PASSWORD=your_password
 
-        current_pass = ft.TextField(label="كلمة المرور الحالية", width=350, password=True, can_reveal_password=True)
-        new_pass = ft.TextField(label="كلمة المرور الجديدة", width=350, password=True, can_reveal_password=True)
-        confirm_pass = ft.TextField(label="تأكيد كلمة المرور", width=350, password=True, can_reveal_password=True)
+# إعدادات التطبيق
+APP_NAME=نظام إدارة العربات اليدوية - الحرم المكي الشريف
+COMPANY_NAME=الرئاسة العامة لشؤون المسجد الحرام والمسجد النبوي
+"""
+        env_path.write_text(env_content, encoding='utf-8')
+        print("✅ تم إنشاء ملف .env - يرجى تحديث بيانات MEGA فيه")
 
-        def save(e):
-            curr = current_pass.value.strip()
-            new = new_pass.value.strip()
-            confirm = confirm_pass.value.strip()
-            result = self.db.execute_query(
-                "SELECT id FROM users WHERE id = ? AND password = ?",
-                (self.current_user['id'], curr)
-            )
-            if not result:
-                self.show_snack_bar("كلمة المرور الحالية غير صحيحة", COLORS['danger'])
-                return
-            if not new:
-                self.show_snack_bar("الرجاء إدخال كلمة المرور الجديدة", COLORS['danger'])
-                return
-            if new != confirm:
-                self.show_snack_bar("كلمة المرور غير متطابقة", COLORS['danger'])
-                return
-            self.db.execute_query(
-                "UPDATE users SET password = ? WHERE id = ?",
-                (new, self.current_user['id'])
-            )
-            self.db.log_action(self.current_user['id'], 'change_own_password', 'تغيير كلمة المرور الشخصية')
-            self.close_dialog()
-            self.show_snack_bar("تم تغيير كلمة المرور بنجاح", COLORS['success'])
-
-        dialog = ft.AlertDialog(
-            title=ft.Text("تغيير كلمة المرور الشخصية", weight=ft.FontWeight.BOLD),
-            content=ft.Container(
-                content=ft.Column([
-                    ft.Text(f"المستخدم: {self.current_user['username']}", size=14, color=COLORS['gray']),
-                    current_pass,
-                    new_pass,
-                    confirm_pass,
-                ], width=400, spacing=15),
-                padding=10,
-            ),
-            actions=[
-                ft.TextButton("حفظ", on_click=save),
-                ft.TextButton("إلغاء", on_click=self.close_dialog),
-            ],
-            actions_alignment=ft.MainAxisAlignment.END,
-        )
-        self.page.dialog = dialog
-        dialog.open = True
-        self.page.update()
-
-
+# ================================ نقطة البداية ================================
 def main(page: ft.Page):
+    # إنشاء ملف .env إذا لم يكن موجوداً
+    create_env_file()
+    
+    # تشغيل التطبيق
     app = CartsManagementApp(page)
 
-
 if __name__ == "__main__":
-    ft.app(target=main, assets_dir="assets")
+    ft.app(target=main)
