@@ -3,7 +3,7 @@ name: Deploy Flet App
 on:
   push:
     branches:
-      - main   # أي تعديل على الفرع الرئيسي هيشغل عملية النشر
+      - main  # أي تعديل على الفرع الرئيسي يتطلب عملية النشر
 
 jobs:
   build:
@@ -22,7 +22,7 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Build Flet Web
-        run: flet build web
+        run: FLET_DEPLOY=true flet build web
 
       - name: Deploy to GitHub Pages
         uses: peaceiris/actions-gh-pages@v3
